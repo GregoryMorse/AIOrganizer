@@ -35,13 +35,14 @@ def main() -> int:
         "mcp",
         "mutagen",
         "openai",
-        "openai_codex",
         "PIL",
         "platformdirs",
         "pydantic",
         "pypdf",
     ):
         command.append(f"--include-package={package}")
+    if sys.platform != "linux":
+        command.append("--include-package=openai_codex")
     if args.platform == "macos-universal2":
         command.append("--macos-target-arch=universal")
     command.append("src/ai_organizer/bootstrap/main.py")
