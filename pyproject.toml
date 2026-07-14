@@ -55,7 +55,7 @@ dev = [
 ]
 release = [
   "cyclonedx-bom>=7,<8",
-  "nuitka>=2.7,<3",
+  "nuitka>=2.7,<5",
   "ordered-set>=4.1,<5",
   "zstandard>=0.24,<1",
 ]
