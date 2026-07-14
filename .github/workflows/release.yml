@@ -129,7 +129,7 @@ jobs:
           merge-multiple: true
       - name: Checksums
         run: sha256sum release/* > release/SHA256SUMS
-      - uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+      - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: "release/*"
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
