@@ -12,6 +12,7 @@ coverage.xml
 .uv-python/
 .nuitka-cache/
 build/
+build-resources/
 dist/
 artifacts/
 *.aioworkspace
