@@ -37,6 +37,16 @@ jobs:
       - name: Build standalone directory
         shell: bash
         run: uv run python packaging/build_portable.py --platform ${{ matrix.artifact }}
+      - name: Launch packaged proof
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            ./build/portable-${{ matrix.artifact }}/main.dist/AIOrganizer.exe --smoke-test
+          else
+            ./build/portable-${{ matrix.artifact }}/main.dist/AIOrganizer --smoke-test
+          fi
       - name: Generate SBOM
         shell: bash
         run: uv run cyclonedx-py environment --output-format JSON --output-file artifacts/AIOrganizer-${{ matrix.artifact }}.cdx.json

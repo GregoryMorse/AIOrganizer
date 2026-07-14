@@ -21,6 +21,7 @@ def main() -> int:
         "-m",
         "nuitka",
         "--standalone",
+        "--assume-yes-for-downloads",
         "--enable-plugin=pyside6",
         "--include-qt-plugins=platforms,imageformats",
         "--output-filename=AIOrganizer",

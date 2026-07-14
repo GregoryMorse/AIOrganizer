@@ -9,16 +9,23 @@ def main() -> int:
         from ai_organizer.mcp_server.server import main as mcp_main
 
         return mcp_main()
-    from PySide6.QtCore import QCoreApplication
+    smoke_test = "--smoke-test" in sys.argv
+    if smoke_test:
+        sys.argv.remove("--smoke-test")
+    from PySide6.QtCore import QCoreApplication, QTimer
     from PySide6.QtWidgets import QApplication
 
     from ai_organizer.desktop.main_window import MainWindow
 
     QCoreApplication.setApplicationName("AIOrganizer")
     QCoreApplication.setOrganizationName("AIOrganizer")
-    application = QApplication(sys.argv)
+    application = QApplication.instance()
+    if application is None:
+        application = QApplication(sys.argv)
     window = MainWindow()
     window.show()
+    if smoke_test:
+        QTimer.singleShot(250, application.quit)
     return application.exec()
 
 
