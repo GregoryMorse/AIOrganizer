@@ -43,10 +43,18 @@ class CodexRuntimeDetector:
             except (OSError, subprocess.SubprocessError):
                 pass
         try:
-            import openai_codex  # noqa: F401
+            from codex_cli_bin import bundled_codex_path
 
-            return CodexRuntime(("sdk",), "bundled-sdk", "pinned", True)
-        except ImportError:
+            bundled = bundled_codex_path()
+            result = subprocess.run(
+                [str(bundled), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+            )
+            return CodexRuntime((str(bundled),), "bundled-runtime", result.stdout.strip(), True)
+        except (ImportError, OSError, subprocess.SubprocessError):
             return None
 
 
@@ -64,32 +72,7 @@ class CodexProvider:
         }
 
     def analyze(self, prompt: CompiledPrompt) -> AnalysisResult:
-        if self.runtime.source == "bundled-sdk":
-            return self._analyze_sdk(prompt)
         return self._analyze_app_server(prompt)
-
-    def _analyze_sdk(self, prompt: CompiledPrompt) -> AnalysisResult:
-        try:
-            from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
-
-            with (
-                tempfile.TemporaryDirectory(prefix="aiorganizer-codex-") as directory,
-                Codex(
-                    CodexConfig(
-                        config_overrides=self._config_overrides(),
-                        cwd=directory,
-                    )
-                ) as codex,
-            ):
-                thread = codex.thread_start(
-                    approval_mode=ApprovalMode.deny_all,
-                    cwd=directory,
-                    sandbox=Sandbox.read_only,
-                )
-                result = thread.run(prompt.text)
-            return AnalysisResult(parse_findings(result.final_response))
-        except Exception as error:
-            raise ProviderError(f"Codex SDK analysis failed: {type(error).__name__}") from error
 
     def _analyze_app_server(self, prompt: CompiledPrompt) -> AnalysisResult:
         environment = os.environ.copy()

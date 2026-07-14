@@ -44,6 +44,9 @@ jobs:
       - name: Install Linux Qt runtime libraries
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libegl1 libxkbcommon-x11-0
+      - name: Install Intel macOS OpenSSL runtime
+        if: matrix.arch == 'x86_64'
+        run: brew install openssl@3
       - run: uv sync --extra desktop --extra analysis --extra providers --extra mcp --extra release --extra dev
       - run: uv run pytest
       - name: Fetch verified official OCR language data
