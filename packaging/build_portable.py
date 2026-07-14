@@ -24,6 +24,7 @@ def main() -> int:
         "--assume-yes-for-downloads",
         "--enable-plugin=pyside6",
         "--include-qt-plugins=platforms,imageformats",
+        "--nofollow-import-to=pytest,hypothesis,*.tests,*.testing",
         "--output-filename=AIOrganizer",
         f"--output-dir={compilation_root}",
     ]
