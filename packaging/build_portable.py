@@ -44,8 +44,6 @@ def main() -> int:
         command.append(f"--include-package={package}")
     if sys.platform != "linux":
         command.append("--include-package=openai_codex")
-    if args.platform == "macos-universal2":
-        command.append("--macos-target-arch=universal")
     command.append("src/ai_organizer/bootstrap/main.py")
     environment = os.environ.copy()
     environment.setdefault("NUITKA_CACHE_DIR", str(root / ".nuitka-cache"))

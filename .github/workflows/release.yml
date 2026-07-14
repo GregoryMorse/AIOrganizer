@@ -19,13 +19,22 @@ jobs:
           - os: windows-latest
             artifact: windows-x64
             package: AIOrganizer-windows-x64.zip
-          - os: macos-latest
-            artifact: macos-universal2
-            package: AIOrganizer-macos-universal2.zip
+            publish: true
           - os: ubuntu-latest
             artifact: linux-x86_64
             package: AIOrganizer-linux-x86_64.tar.gz
+            publish: true
+          - os: macos-latest
+            artifact: macos-arm64
+            arch: arm64
+            publish: false
+          - os: macos-15-intel
+            artifact: macos-x86_64
+            arch: x86_64
+            publish: false
     runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
@@ -46,32 +55,76 @@ jobs:
         run: uv run python packaging/build_portable.py --platform ${{ matrix.artifact }}
       - name: Launch packaged proof
         shell: bash
-        env:
-          QT_QPA_PLATFORM: offscreen
         run: |
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             ./build/portable-${{ matrix.artifact }}/main.dist/AIOrganizer.exe --smoke-test
           else
+            chmod +x ./build/portable-${{ matrix.artifact }}/main.dist/AIOrganizer
             ./build/portable-${{ matrix.artifact }}/main.dist/AIOrganizer --smoke-test
           fi
       - name: Generate SBOM
+        if: matrix.publish
         shell: bash
         run: uv run cyclonedx-py environment --output-format JSON --output-file artifacts/AIOrganizer-${{ matrix.artifact }}.cdx.json
       - uses: actions/attest-sbom@51e74621a501c89df81fc1391c5a8f4cfc9fab2f # v3
+        if: matrix.publish
         with:
           subject-path: artifacts/${{ matrix.package }}
           sbom-path: artifacts/AIOrganizer-${{ matrix.artifact }}.cdx.json
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: matrix.publish
         with:
           name: AIOrganizer-${{ matrix.artifact }}
           path: artifacts/*
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: runner.os == 'macOS'
+        with:
+          name: macos-native-${{ matrix.arch }}
+          path: build/portable-${{ matrix.artifact }}/main.dist
+          include-hidden-files: true
+
+  macos-universal:
+    needs: build
+    runs-on: macos-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.9.18"
+      - run: uv python install 3.12
+      - run: uv sync --extra desktop --extra analysis --extra providers --extra mcp --extra release
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: macos-native-arm64
+          path: native/arm64
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: macos-native-x86_64
+          path: native/x86_64
+      - name: Merge universal2 application
+        run: uv run python packaging/merge_macos_universal.py native/arm64 native/x86_64 build/portable-macos-universal2/main.dist --archive artifacts/AIOrganizer-macos-universal2.zip
+      - name: Launch universal2 proof
+        run: build/portable-macos-universal2/main.dist/AIOrganizer --smoke-test
+      - name: Generate SBOM
+        run: uv run cyclonedx-py environment --output-format JSON --output-file artifacts/AIOrganizer-macos-universal2.cdx.json
+      - uses: actions/attest-sbom@51e74621a501c89df81fc1391c5a8f4cfc9fab2f # v3
+        with:
+          subject-path: artifacts/AIOrganizer-macos-universal2.zip
+          sbom-path: artifacts/AIOrganizer-macos-universal2.cdx.json
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: AIOrganizer-macos-universal2
+          path: artifacts/*
 
   publish:
-    needs: build
+    needs: [build, macos-universal]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
+          pattern: AIOrganizer-*
           path: release
           merge-multiple: true
       - name: Checksums
