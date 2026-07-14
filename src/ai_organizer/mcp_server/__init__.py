@@ -1,0 +1,1 @@
+"""Proposal-only MCP server."""

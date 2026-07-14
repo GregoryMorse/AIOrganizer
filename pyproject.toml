@@ -1,0 +1,107 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aiorganizer"
+version = "0.1.0a1"
+description = "Human-approved, AI-assisted local file organization"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+license = { file = "LICENSE" }
+authors = [{ name = "AIOrganizer contributors" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Desktop Environment :: File Managers",
+]
+dependencies = [
+  "platformdirs>=4.3,<5",
+  "pydantic>=2.11,<3",
+]
+
+[project.optional-dependencies]
+desktop = [
+  "PySide6==6.11.1",
+]
+analysis = [
+  "Pillow>=11,<13",
+  "pypdf>=5,<7",
+  "lingua-language-detector>=2.1,<3",
+  "mutagen>=1.47,<2",
+]
+providers = [
+  "anthropic>=0.68,<1",
+  "keyring>=25,<27",
+  "openai>=2,<3",
+  "openai-codex>=0.1.0b1",
+]
+mcp = [
+  "mcp[cli]>=1.27,<2",
+]
+dev = [
+  "coverage[toml]>=7.10,<8",
+  "hatchling>=1.27,<2",
+  "hypothesis>=6.140,<7",
+  "mypy>=1.18,<2",
+  "pytest>=8.4,<10",
+  "pytest-cov>=6,<8",
+  "pytest-qt>=4.5,<5",
+  "ruff>=0.13,<1",
+]
+release = [
+  "cyclonedx-bom>=7,<8",
+  "nuitka>=2.7,<3",
+  "ordered-set>=4.1,<5",
+  "zstandard>=0.24,<1",
+]
+
+[project.scripts]
+aiorganizer = "ai_organizer.bootstrap.main:main"
+aiorganizer-mcp = "ai_organizer.mcp_server.server:main"
+aiorganizer-generate-corpus = "ai_organizer.cli.synthetic_corpus:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ai_organizer"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+markers = [
+  "integration: uses real filesystem or subprocess integration",
+  "ui: requires PySide6",
+  "live_provider: requires protected provider credentials",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["ai_organizer"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+# Phase 1 includes a large Qt proof surface whose interaction paths are exercised
+# separately by headless UI smoke tests. Raise this baseline as those workflows
+# gain stable automation; the safety-critical domain and transaction paths are
+# already covered directly.
+fail_under = 40
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["ai_organizer.domain", "ai_organizer.application"]
+
+[tool.uv]
+default-groups = []

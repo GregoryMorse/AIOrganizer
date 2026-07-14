@@ -1,0 +1,6 @@
+AIOrganizer
+Copyright 2026 AIOrganizer contributors
+
+This product includes Qt for Python/PySide6 and may include Tesseract OCR and
+language data. Their license texts and attributions must be included in binary
+release bundles. See THIRD_PARTY_NOTICES.md.

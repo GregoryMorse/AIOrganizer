@@ -1,0 +1,40 @@
+name: Protected provider smoke tests
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 3 * * 6"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    environment: live-providers
+    runs-on: windows-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.9.18"
+      - run: uv python install 3.12
+      - run: uv sync --extra providers --extra dev
+      - run: uv run pytest -m live_provider
+
+  codex-subscription:
+    if: ${{ vars.ENABLE_CODEX_SUBSCRIPTION_SMOKE == 'true' }}
+    environment: live-providers
+    runs-on: [self-hosted, aiorganizer-codex]
+    env:
+      AIORGANIZER_CODEX_LIVE: "1"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.9.18"
+      - run: uv python install 3.12
+      - run: uv sync --extra providers --extra dev
+      - run: uv run pytest tests/live/test_providers.py -k codex_subscription

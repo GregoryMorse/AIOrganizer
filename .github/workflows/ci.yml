@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.9.18"
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --extra dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy -p ai_organizer.domain -p ai_organizer.application
+
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.9.18"
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --extra analysis --extra dev
+      - name: Test
+        run: uv run pytest --cov --cov-report=xml
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        if: always()
+        with:
+          name: coverage-${{ matrix.os }}
+          path: coverage.xml
+
+  ui-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: ${{ matrix.os == 'ubuntu-latest' && 'offscreen' || '' }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.9.18"
+          enable-cache: true
+      - run: uv python install 3.12
+      - run: uv sync --extra desktop --extra dev
+      - run: uv run pytest -m ui
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.9.18"
+      - run: uv python install 3.12
+      - run: uv sync --all-extras
+      - run: uv export --all-extras --no-hashes > requirements-audit.txt
+      - run: uvx pip-audit -r requirements-audit.txt

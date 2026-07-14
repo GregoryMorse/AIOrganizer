@@ -1,0 +1,73 @@
+name: Prerelease
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: windows-x64
+            package: AIOrganizer-windows-x64.zip
+          - os: macos-latest
+            artifact: macos-universal2
+            package: AIOrganizer-macos-universal2.zip
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+            package: AIOrganizer-linux-x86_64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.9.18"
+      - run: uv python install 3.12
+      - run: uv sync --extra desktop --extra analysis --extra providers --extra mcp --extra release
+      - run: uv run pytest
+      - name: Build standalone directory
+        shell: bash
+        run: uv run python packaging/build_portable.py --platform ${{ matrix.artifact }}
+      - name: Generate SBOM
+        shell: bash
+        run: uv run cyclonedx-py environment --output-format JSON --output-file artifacts/AIOrganizer-${{ matrix.artifact }}.cdx.json
+      - uses: actions/attest-sbom@51e74621a501c89df81fc1391c5a8f4cfc9fab2f # v3
+        with:
+          subject-path: artifacts/${{ matrix.package }}
+          sbom-path: artifacts/AIOrganizer-${{ matrix.artifact }}.cdx.json
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: AIOrganizer-${{ matrix.artifact }}
+          path: artifacts/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          path: release
+          merge-multiple: true
+      - name: Checksums
+        run: sha256sum release/* > release/SHA256SUMS
+      - uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: "release/*"
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: release/*
+          body: |
+            Unsigned AIOrganizer alpha. Use copied data first.
+            Windows SmartScreen and macOS Gatekeeper may warn about these artifacts.
+            Cross-volume originals remain in quarantine until reviewed cleanup.

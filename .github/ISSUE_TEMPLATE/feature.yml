@@ -1,0 +1,25 @@
+name: Feature proposal
+description: Propose a scoped AIOrganizer improvement
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem should be solved?
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and privacy impact
+      description: Describe changes to data access, proposals, commits, deletion, cloud use, or credentials.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+    validations:
+      required: true
