@@ -37,8 +37,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libegl1 libxkbcommon-x11-0
       - run: uv sync --extra desktop --extra analysis --extra providers --extra mcp --extra release
       - run: uv run pytest
+      - name: Fetch verified official OCR language data
+        run: uv run python packaging/fetch_tessdata.py build-resources/tesseract/tessdata
       - name: Build standalone directory
         shell: bash
+        env:
+          AIORGANIZER_TESSERACT_BUNDLE: build-resources/tesseract
         run: uv run python packaging/build_portable.py --platform ${{ matrix.artifact }}
       - name: Launch packaged proof
         shell: bash
