@@ -35,7 +35,7 @@ jobs:
       - name: Install Linux Qt runtime libraries
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libegl1 libxkbcommon-x11-0
-      - run: uv sync --extra desktop --extra analysis --extra providers --extra mcp --extra release
+      - run: uv sync --extra desktop --extra analysis --extra providers --extra mcp --extra release --extra dev
       - run: uv run pytest
       - name: Fetch verified official OCR language data
         run: uv run python packaging/fetch_tessdata.py build-resources/tesseract/tessdata
