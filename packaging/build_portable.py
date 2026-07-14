@@ -24,7 +24,14 @@ def main() -> int:
         "--assume-yes-for-downloads",
         "--enable-plugin=pyside6",
         "--include-qt-plugins=platforms,imageformats",
-        "--nofollow-import-to=pytest,hypothesis,*.tests,*.testing",
+        # FastMCP requires cryptography only for optional OAuth/JWT transports.
+        # AIOrganizer's bundled MCP boundary is local, unauthenticated stdio and
+        # has no approval/commit tools. Excluding it also avoids a Nuitka 2.8.10
+        # Intel-macOS dependency-scanner failure in cryptography's OpenSSL wheel.
+        (
+            "--nofollow-import-to="
+            "pytest,hypothesis,*.tests,*.testing,cryptography"
+        ),
         "--output-filename=AIOrganizer",
         f"--output-dir={compilation_root}",
     ]

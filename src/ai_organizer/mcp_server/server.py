@@ -264,12 +264,11 @@ def main() -> int:
         default=os.environ.get("AIORGANIZER_WORKSPACE", ""),
         help="Local .aioworkspace path",
     )
-    parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
     args = parser.parse_args()
     if not args.workspace:
         parser.error("--workspace or AIORGANIZER_WORKSPACE is required")
     server = build_server(Path(args.workspace))
-    server.run(transport=args.transport)
+    server.run(transport="stdio")
     return 0
 
 

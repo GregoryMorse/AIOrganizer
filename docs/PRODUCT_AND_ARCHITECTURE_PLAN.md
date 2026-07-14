@@ -633,7 +633,7 @@ For cloud providers, show a concise request summary: provider, model, number of 
 
 ### 18.4 Local service security
 
-- stdio MCP is the default;
+- stdio is the only application-exposed MCP transport;
 - any HTTP service binds to loopback and uses a high-entropy capability token;
 - no permissive cross-origin policy;
 - provider and Microsoft tokens live in the OS keyring;
