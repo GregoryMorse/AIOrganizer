@@ -64,18 +64,29 @@ class PdfExtractor:
         reader = PdfReader(path)
         if reader.is_encrypted:
             return Evidence(item.id, "pdf", "Encrypted PDF", facts={"encrypted": True})
-        pages: list[str] = []
-        for page in reader.pages[:50]:
-            pages.append((page.extract_text() or "")[:100_000])
+        pages = [(page.extract_text() or "")[:100_000] for page in reader.pages[:50]]
         text = "\n".join(pages)[:MAX_TEXT_BYTES]
-        coverage = min(1.0, len(text.strip()) / max(1, len(reader.pages) * 800))
+        page_coverage = [min(1.0, len(value.strip()) / 800) for value in pages]
+        coverage = sum(page_coverage) / max(1, len(page_coverage))
+        ocr_candidates = [
+            index for index, value in enumerate(page_coverage) if value < 0.15
+        ][:20]
         ocr_used = False
-        if coverage < 0.15 and self.ocr and self.ocr.available():
-            ocr_text = self.ocr.recognize(path)
-            if ocr_text.strip():
-                text = ocr_text[:MAX_TEXT_BYTES]
-                coverage = min(0.85, len(text.strip()) / max(1, len(reader.pages) * 800))
+        ocr_available = bool(self.ocr and self.ocr.available())
+        if ocr_candidates and self.ocr and ocr_available:
+            recognized = self.ocr.recognize_pages(path, ocr_candidates)
+            for page_index, ocr_text in recognized.items():
+                if ocr_text.strip() and page_index < len(pages):
+                    pages[page_index] = ocr_text[:100_000]
+                    page_coverage[page_index] = min(0.85, len(ocr_text.strip()) / 800)
+            if recognized:
                 ocr_used = True
+            text = "\n".join(pages)[:MAX_TEXT_BYTES]
+            coverage = sum(page_coverage) / max(1, len(page_coverage))
+        remaining_ocr = [
+            index for index, value in enumerate(page_coverage) if value < 0.15
+        ]
+        route = _confidence_route(coverage, bool(remaining_ocr), ocr_available)
         languages = LanguageDetector().detect(text)
         return Evidence(
             item.id,
@@ -83,15 +94,23 @@ class PdfExtractor:
             text[:2_000],
             facts={
                 "page_count": len(reader.pages),
+                "pages": pages,
+                "page_text_coverage": page_coverage,
                 "text": text,
                 "text_coverage": coverage,
-                "needs_ocr": coverage < 0.15,
+                "needs_ocr": bool(remaining_ocr),
+                "ocr_candidate_pages": ocr_candidates,
+                "ocr_remaining_pages": remaining_ocr,
+                "ocr_available": ocr_available,
                 "ocr_used": ocr_used,
                 "metadata": {str(k): str(v) for k, v in (reader.metadata or {}).items()},
             },
             confidence=coverage,
             language_candidates=languages,
             provenance=self.name,
+            confidence_route=route,
+            content_classes=["extracted_text"],
+            extractor_version="2",
         )
 
 
@@ -128,7 +147,8 @@ class TextExtractor:
         return path.suffix.casefold() in self.TEXT_SUFFIXES or item.mime_type.startswith("text/")
 
     def extract(self, path: Path, item: ItemSnapshot) -> Evidence:
-        raw = path.read_bytes()[:MAX_TEXT_BYTES]
+        with path.open("rb") as stream:
+            raw = stream.read(MAX_TEXT_BYTES)
         for encoding in ("utf-8-sig", "utf-16", "latin-1"):
             try:
                 text = raw.decode(encoding)
@@ -142,11 +162,16 @@ class TextExtractor:
             facts={"text": text, "truncated": path.stat().st_size > len(raw)},
             confidence=0.95,
             provenance=self.name,
+            confidence_route="high_confidence",
+            content_classes=["extracted_text"],
         )
 
 
 class ImageExtractor:
     name = "pillow"
+
+    def __init__(self, ocr: TesseractOcr | None = None) -> None:
+        self.ocr = ocr
 
     def supports(self, path: Path, item: ItemSnapshot) -> bool:
         return item.mime_type.startswith("image/")
@@ -156,6 +181,8 @@ class ImageExtractor:
 
         with Image.open(path) as image:
             exif = {str(key): str(value) for key, value in image.getexif().items()}
+            ocr_available = bool(self.ocr and self.ocr.available())
+            text = self.ocr.recognize(path, ["eng"])[:MAX_TEXT_BYTES] if ocr_available and self.ocr else ""
             return Evidence(
                 item.id,
                 "image",
@@ -165,10 +192,18 @@ class ImageExtractor:
                     "width": image.width,
                     "height": image.height,
                     "exif": exif,
-                    "needs_ocr": True,
+                    "text": text,
+                    "needs_ocr": not bool(text.strip()),
+                    "ocr_available": ocr_available,
+                    "ocr_used": bool(text.strip()),
                 },
-                confidence=0.9,
+                confidence=0.85 if text.strip() else 0.5,
                 provenance=self.name,
+                confidence_route=(
+                    "needs_review" if text.strip() else "ocr_unavailable" if not ocr_available else "needs_review"
+                ),
+                content_classes=["visual_content", "extracted_text"] if text.strip() else ["visual_content"],
+                extractor_version="2",
             )
 
 
@@ -190,7 +225,8 @@ class OfficeContainerExtractor:
                 if name.endswith(".xml") and not name.startswith(("_rels/", "customXml/"))
             ]
             for name in safe_names[:200]:
-                data = archive.read(name)[:500_000]
+                with archive.open(name) as stream:
+                    data = stream.read(500_000)
                 try:
                     root = ElementTree.fromstring(data)
                 except ElementTree.ParseError:
@@ -206,6 +242,8 @@ class OfficeContainerExtractor:
             facts={"text": text},
             confidence=0.85,
             provenance=self.name,
+            confidence_route="high_confidence" if text.strip() else "needs_review",
+            content_classes=["extracted_text"],
         )
 
 
@@ -216,7 +254,8 @@ class EmailExtractor:
         return path.suffix.casefold() == ".eml"
 
     def extract(self, path: Path, item: ItemSnapshot) -> Evidence:
-        message = email.message_from_bytes(path.read_bytes()[:MAX_TEXT_BYTES])
+        with path.open("rb") as stream:
+            message = email.message_from_bytes(stream.read(MAX_TEXT_BYTES))
         body = ""
         if message.is_multipart():
             for part in message.walk():
@@ -239,6 +278,8 @@ class EmailExtractor:
             facts=facts,
             confidence=0.9,
             provenance=self.name,
+            confidence_route="high_confidence",
+            content_classes=["extracted_text"],
         )
 
 
@@ -338,10 +379,13 @@ class TesseractOcr:
         )
         bundled_data = bundled.parent / "tessdata"
         self.environment = os.environ.copy()
+        self._available: bool | None = None
         if bundled_data.is_dir():
             self.environment["TESSDATA_PREFIX"] = str(bundled_data)
 
     def available(self) -> bool:
+        if self._available is not None:
+            return self._available
         try:
             result = subprocess.run(
                 [self.executable, "--version"],
@@ -350,9 +394,12 @@ class TesseractOcr:
                 text=True,
                 timeout=10,
             )
-            return self.REQUIRED_VERSION in result.stdout.splitlines()[0]
+            first_line = result.stdout.splitlines()[0] if result.stdout else ""
+            match = re.search(r"tesseract\s+(\d+)\.(\d+)", first_line, re.IGNORECASE)
+            self._available = bool(match and int(match.group(1)) >= 5)
         except (OSError, subprocess.SubprocessError):
-            return False
+            self._available = False
+        return self._available
 
     def detect_script(self, image: Path) -> str:
         result = subprocess.run(
@@ -393,31 +440,42 @@ class QtPdfOcr:
         except ImportError:
             return False
 
-    def recognize(self, pdf_path: Path) -> str:
+    def recognize_pages(self, pdf_path: Path, page_indices: list[int]) -> dict[int, str]:
         from PySide6.QtCore import QSize
         from PySide6.QtPdf import QPdfDocument
 
         document = QPdfDocument()
         if document.load(str(pdf_path)) != QPdfDocument.Error.None_:
-            return ""
-        fragments: list[str] = []
+            return {}
+        fragments: dict[int, str] = {}
         with tempfile.TemporaryDirectory(prefix="aiorganizer-ocr-") as temporary:
-            for page in range(min(document.pageCount(), self.max_pages)):
+            allowed = sorted(
+                {
+                    page
+                    for page in page_indices
+                    if 0 <= page < document.pageCount()
+                }
+            )[: self.max_pages]
+            for page in allowed:
                 image = document.render(page, QSize(1800, 2400))
                 image_path = Path(temporary) / f"page-{page:04d}.png"
                 if image.isNull() or not image.save(str(image_path), "PNG"):
                     continue
-                fragments.append(self.tesseract.recognize(image_path, ["eng"]))
+                fragments[page] = self.tesseract.recognize(image_path, ["eng"])
         document.close()
-        return "\n".join(fragments)
+        return fragments
+
+    def recognize(self, pdf_path: Path) -> str:
+        return "\n".join(self.recognize_pages(pdf_path, list(range(self.max_pages))).values())
 
 
 def default_registry() -> ExtractionRegistry:
+    tesseract = TesseractOcr()
     return ExtractionRegistry(
         [
-            PdfExtractor(QtPdfOcr()),
+            PdfExtractor(QtPdfOcr(tesseract)),
             TextExtractor(),
-            ImageExtractor(),
+            ImageExtractor(tesseract),
             OfficeContainerExtractor(),
             EmailExtractor(),
             ArchiveExtractor(),
@@ -425,3 +483,13 @@ def default_registry() -> ExtractionRegistry:
             GenericExtractor(),
         ]
     )
+
+
+def _confidence_route(coverage: float, needs_ocr: bool, ocr_available: bool) -> str:
+    if needs_ocr and not ocr_available:
+        return "ocr_unavailable"
+    if needs_ocr:
+        return "ocr_required"
+    if coverage >= 0.6:
+        return "high_confidence"
+    return "needs_review"

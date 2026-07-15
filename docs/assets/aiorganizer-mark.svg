@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">AIOrganizer application mark</title>
+  <desc id="desc">Structured document tiles rise into an organized folder, accented by an AI spark.</desc>
+  <defs>
+    <linearGradient id="bg" x1="64" y1="448" x2="448" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#102A43"/>
+      <stop offset="0.55" stop-color="#155E75"/>
+      <stop offset="1" stop-color="#0F766E"/>
+    </linearGradient>
+    <linearGradient id="folder" x1="139" y1="314" x2="378" y2="177" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#CCFBF1"/>
+      <stop offset="1" stop-color="#F0FDFA"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%">
+      <feDropShadow dx="0" dy="14" stdDeviation="16" flood-color="#06212B" flood-opacity="0.26"/>
+    </filter>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="112" fill="url(#bg)"/>
+  <path d="M122 337V202c0-17 13-30 30-30h72l30 34h106c17 0 30 13 30 30v101c0 17-13 30-30 30H152c-17 0-30-13-30-30Z" fill="url(#folder)" filter="url(#shadow)"/>
+  <path d="M122 238h268v99c0 17-13 30-30 30H152c-17 0-30-13-30-30v-99Z" fill="#D7FAF4"/>
+  <path d="M144 238h224" stroke="#77D8CC" stroke-width="8" stroke-linecap="round" opacity="0.72"/>
+  <g fill="#155E75">
+    <rect x="157" y="273" width="48" height="48" rx="12"/>
+    <rect x="220" y="273" width="48" height="48" rx="12" opacity="0.76"/>
+    <rect x="283" y="273" width="48" height="48" rx="12" opacity="0.52"/>
+  </g>
+  <path d="M181 345h150" stroke="#2BA99A" stroke-width="12" stroke-linecap="round" opacity="0.62"/>
+  <path d="M256 337V281" stroke="#F0FDFA" stroke-width="12" stroke-linecap="round"/>
+  <path d="m236 301 20-20 20 20" fill="none" stroke="#F0FDFA" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#FDE68A">
+    <path d="M377 104c5 27 17 39 44 44-27 5-39 17-44 44-5-27-17-39-44-44 27-5 39-17 44-44Z"/>
+    <path d="M321 91c3 15 10 22 25 25-15 3-22 10-25 25-3-15-10-22-25-25 15-3 22-10 25-25Z" opacity="0.84"/>
+    <circle cx="427" cy="96" r="8" opacity="0.72"/>
+  </g>
+  <rect x="24" y="24" width="464" height="464" rx="112" fill="none" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="4"/>
+</svg>

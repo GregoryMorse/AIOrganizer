@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AIOrganizer
+Comment=Review AI-assisted organization proposals
+Exec=AIOrganizer
+Icon=aiorganizer
+Terminal=false
+Categories=Utility;FileTools;
+Keywords=organize;files;metadata;outlook;

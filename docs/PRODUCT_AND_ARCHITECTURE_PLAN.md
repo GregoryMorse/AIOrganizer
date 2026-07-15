@@ -1,8 +1,8 @@
 # AI Organizer: Product and Architecture Plan
 
-Status: Phase 0–1 implementation baseline  
-Date: 2026-07-14  
-Scope: local files, folder planning, focused actions, and moves; Outlook and recurring-document tracking follow in staged releases
+Status: Phase 0–5 implementation baseline
+Date: 2026-07-15
+Scope: local files, folder planning, focused actions, moves, cleanup, and reviewed recurring-document tracking; Outlook follows in a staged release
 
 > **Phase 1 decision update:** Where older sequencing text below defers moves,
 > cross-volume handling, categories, layered prompts, Anthropic, or embedded Codex,
@@ -10,7 +10,36 @@ Scope: local files, folder planning, focused actions, and moves; Outlook and rec
 > in-place folder rename, regular-file and approved atomic-project moves, and the
 > copy/verify/finalize/indefinite-quarantine protocol. It also includes OpenAI,
 > Anthropic, and an embedded Codex app-server/SDK path. Cleanup and Outlook remain
-> roadmap work.
+> Outlook remains roadmap work; Cleanup is implemented by the Phase 4 update below.
+
+> **Phase 2 implementation update:** Evidence extraction now routes individual low-text PDF pages
+> to optional local Tesseract OCR, records confidence/review state, and runs extraction/provider
+> calls outside the UI thread. Direct providers are schema-validated and governed by persistent
+> per-source metadata/text/image privacy levels with a visible request preview. The stdio MCP server
+> exposes bounded evidence, resource, prompt, and proposal-editing surfaces. Proposal writes require
+> an expiring desktop-created selection scope, expected revision, and persistent idempotency key;
+> they are separately audited and cannot approve or commit work.
+
+> **Phase 3 implementation update:** Folder review now uses a row-aligned union hierarchy with
+> projected descendants and ghost creates. Folder renames are in-place only. File move and folder
+> plans receive case-aware projected-state collision and containment preflight, and generic actions
+> cannot cross detected project boundaries. Journals persist enough observed state for explicit
+> restart recovery, including interrupted swaps and interrupted recovery itself; verified plans
+> remain undoable after reopening a workspace.
+
+> **Phase 4 implementation update:** Cleanup is an explicit, typed-confirmation workflow that
+> sends empty folders, inactive AIOrganizer partials, and manifest-backed generated artifacts to a
+> hidden, restorable per-source quarantine. It exposes item/byte totals, derivation, regeneration
+> evidence, and exclusions, never permanent deletion. Cross-volume copy failures remove known
+> partial targets while preserving authoritative sources; preflight covers destination space and
+> verification covers regular content and symbolic-link structure.
+
+> **Phase 5 implementation update:** Period-bearing document patterns become candidates only and
+> remain untracked until the user reviews series fields and individual membership. Reviewed series
+> persist root-relative observation identities and source fingerprints. The gap matrix distinguishes
+> verified, ambiguous, missing, not-due, grace-window, skipped, and ignored periods with a deadline
+> and explanation on every row. Exceptions are individual and reasoned. A metadata-only attachment
+> matcher is ready for future connectors but has no content retrieval or download authority.
 
 ## 1. Executive decision
 
@@ -720,6 +749,9 @@ Gate: pass fault-injection tests for rename operations and complete a user-super
 
 ### Phase 2: AI evidence and MCP proposal editing (approximately 3–5 weeks)
 
+Implementation baseline completed 2026-07-15. Platform OCR quality and live-provider evaluation
+remain continuing test-corpus work rather than a reason to weaken the safety gate.
+
 Deliver:
 
 - selective OCR and confidence routing
@@ -731,6 +763,9 @@ Deliver:
 Gate: demonstrate that no MCP or provider path can reach commit authority, arbitrary paths, or out-of-scope items.
 
 ### Phase 3: folder plan and file moves (approximately 4–6 weeks)
+
+Implementation baseline completed 2026-07-15. Continued copied-corpus trials remain part of the
+release-hardening gate.
 
 Deliver:
 
@@ -744,6 +779,10 @@ Gate: execute and undo multi-step rename/move scenarios with swaps, locks, chang
 
 ### Phase 4: cleanup and cross-volume safety (approximately 3–5 weeks)
 
+Implementation baseline completed 2026-07-15. Copied-corpus recovery trials and platform-specific
+recycle-bin UX remain release-hardening work; the portable baseline deliberately uses the fully
+restorable AIOrganizer quarantine.
+
 Deliver:
 
 - empty-folder and evidence-backed build-artifact cleanup
@@ -755,6 +794,10 @@ Gate: no permanent delete capability; recovery tests cover partial copies and in
 
 ### Phase 5: recurring documents (approximately 3–5 weeks)
 
+Implementation baseline completed 2026-07-15. Broader multilingual period extraction and future
+mail-connector evaluation remain corpus and integration work, not permission to auto-track or
+download documents.
+
 Deliver:
 
 - reviewed series creation
@@ -764,6 +807,17 @@ Deliver:
 Gate: false gaps are explainable and individually dismissible; no automatic downloads.
 
 ### Phase 6: Microsoft Graph email integration (approximately 5–8 weeks)
+
+Implementation baseline completed 2026-07-15. The connector is opt-in, uses delegated device sign-in,
+keeps the MSAL token cache in the OS credential store, and starts with read-only scopes. Workspace
+schema v10 stores bounded message/attachment metadata, per-folder opaque delta links, security
+evidence, and separately reviewed proposals. Folder, message-move, category, and rule writes require
+an exact incremental permission review and typed confirmation; remote message state is checked again
+before mutation. The transport exposes no send, reply, forward, delete, or permanent-delete method.
+
+Automated fake-transport coverage is complete. A sustained real Microsoft 365 test-tenant soak is
+still required before the Phase 6 release gate can be declared complete; live credentials and tenant
+content are deliberately not part of the repository or ordinary development workflow.
 
 Deliver:
 
@@ -776,6 +830,19 @@ Deliver:
 Gate: permission review, test-tenant soak, remote-state conflict handling, and no send/permanent-delete behavior.
 
 ### Phase 7: Outlook companion and broader release work
+
+Implementation baseline completed 2026-07-15. A validated Office.js `ReadItem` task pane exports only
+selected-item header/attachment descriptors through a strict metadata handoff; the desktop imports it as
+untrusted semantic evidence with no mailbox or commit authority. First-run onboarding, complete workspace
+backup, privacy-separated review/diagnostic exports, text scaling, high contrast, and Qt translation-catalog
+loading are present. Contributor rules, a versioned provider manifest/schema, manual native package
+definitions, CycloneDX SBOMs, checksums, and GitHub provenance/SBOM attestations are documented and tested.
+
+The fast Python loop and manual-only workflows remain unchanged. Native Windows/macOS/Linux signing hooks
+require explicit release mode and real external identities, pass no certificate password on the command
+line, and verify signatures after signing. No publisher certificate or Apple notarization identity was
+available in development, so a certificate-backed public artifact and store/notarization review remain
+external release gates rather than falsely claimed results.
 
 Deliver:
 

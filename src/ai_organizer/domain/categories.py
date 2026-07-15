@@ -17,6 +17,7 @@ from .models import (
 @dataclass(frozen=True, slots=True)
 class EffectivePolicy:
     category_ids: frozenset[str]
+    tag_ids: frozenset[str]
     roles: frozenset[FolderRole]
     cloud_policy: CloudPolicy
     sensitivity: Sensitivity
@@ -48,8 +49,11 @@ class RoutingDecision:
 class CategoryResolver:
     _cloud_rank: ClassVar[dict[CloudPolicy, int]] = {
         CloudPolicy.NONE: 0,
-        CloudPolicy.INHERIT: 1,
-        CloudPolicy.TEXT_AND_IMAGES: 2,
+        CloudPolicy.LOCAL_ONLY: 0,
+        CloudPolicy.METADATA_ONLY: 1,
+        CloudPolicy.CLOUD_TEXT: 2,
+        CloudPolicy.TEXT_AND_IMAGES: 3,
+        CloudPolicy.INHERIT: 4,
     }
     _sensitivity_rank: ClassVar[dict[Sensitivity, int]] = {
         Sensitivity.NORMAL: 0,
@@ -76,16 +80,20 @@ class CategoryResolver:
         ]
         applicable.sort(key=lambda assignment: len(assignment.path.parts))
         category_ids: set[str] = set()
+        tag_ids: set[str] = set()
         roles: set[FolderRole] = set()
         revision = 0
         for assignment in applicable:
             category_ids.update(assignment.category_ids)
+            tag_ids.update(assignment.tag_ids)
             if assignment.override_roles:
                 roles = set(assignment.roles)
             else:
                 roles.update(assignment.roles)
             revision = max(revision, assignment.revision)
         definitions = [categories[cid] for cid in category_ids if cid in categories]
+        for definition in definitions:
+            tag_ids.update(definition.default_tag_ids)
         sensitivity = max(
             (definition.sensitivity for definition in definitions),
             key=lambda value: self._sensitivity_rank[value],
@@ -115,6 +123,7 @@ class CategoryResolver:
         )
         return EffectivePolicy(
             frozenset(category_ids),
+            frozenset(tag_ids),
             frozenset(roles),
             cloud,
             sensitivity,

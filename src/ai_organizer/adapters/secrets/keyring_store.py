@@ -12,9 +12,15 @@ class SecretStore:
         keyring.set_password(self.SERVICE, name, value)
 
     def get(self, name: str) -> str | None:
-        import keyring
+        try:
+            import keyring
+        except ImportError:
+            return None
 
-        return keyring.get_password(self.SERVICE, name)
+        try:
+            return keyring.get_password(self.SERVICE, name)
+        except keyring.errors.KeyringError:
+            return None
 
     def delete(self, name: str) -> None:
         import keyring

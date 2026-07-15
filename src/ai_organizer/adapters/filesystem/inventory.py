@@ -6,8 +6,9 @@ import mimetypes
 import os
 import platform
 import stat
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,7 +25,32 @@ PROJECT_MARKERS = {
     "pom.xml",
     "build.gradle",
     "CMakeLists.txt",
+    "Cargo.lock",
+    "Gemfile",
+    "Makefile",
+    "composer.json",
+    "gradlew",
+    "meson.build",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "requirements.txt",
+    "uv.lock",
+    "yarn.lock",
 }
+PROJECT_MARKER_SUFFIXES = (".sln", ".xcodeproj", ".code-workspace")
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryProgress:
+    item_count: int
+    file_count: int
+    discovered_bytes: int
+    current_path: str
+
+
+class ScanCancelled(RuntimeError):
+    """Raised when an interactive inventory scan is cancelled."""
 
 
 class FileSystemInventory:
@@ -51,18 +77,33 @@ class FileSystemInventory:
             supports_placeholders=platform.system() == "Windows",
         )
 
-    def scan(self, root_id: str, root: Path, exclusions: Sequence[str]) -> list[ItemSnapshot]:
+    def scan(
+        self,
+        root_id: str,
+        root: Path,
+        exclusions: Sequence[str],
+        progress: Callable[[DiscoveryProgress], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> list[ItemSnapshot]:
         root_resolved = root.resolve(strict=True)
+        root_markers = _project_markers(root_resolved)
+        root_is_project = bool(root_markers)
         root_device = root_resolved.stat(follow_symlinks=False).st_dev
         results: list[ItemSnapshot] = []
+        file_count = 0
+        discovered_bytes = 0
         stack = [root_resolved]
         while stack:
+            if cancelled and cancelled():
+                raise ScanCancelled("Inventory scan cancelled")
             directory = stack.pop()
             try:
                 entries = list(os.scandir(directory))
             except OSError:
                 continue
             for entry in entries:
+                if cancelled and cancelled():
+                    raise ScanCancelled("Inventory scan cancelled")
                 path = Path(entry.path)
                 relative = path.relative_to(root_resolved).as_posix()
                 if _excluded(relative, exclusions):
@@ -78,26 +119,29 @@ class FileSystemInventory:
                     if (_is_reparse_point(info) and not placeholder) or crosses_device:
                         continue
                     is_dir = stat.S_ISDIR(info.st_mode)
+                    child_files, child_folders = _child_counts(path) if is_dir else (0, 0)
                     file_id = f"{info.st_dev}:{info.st_ino}"
                     mime = "inode/directory" if is_dir else _mime(path)
-                    project_markers = (
-                        tuple(
-                            sorted(marker for marker in PROJECT_MARKERS if (path / marker).exists())
-                        )
-                        if is_dir
-                        else ()
-                    )
+                    project_markers = _project_markers(path) if is_dir else ()
                     item = ItemSnapshot(
                         id=f"item_{uuid4().hex}",
                         root_id=root_id,
                         relative_path=relative,
                         size=info.st_size,
                         modified_ns=info.st_mtime_ns,
+                        created_ns=getattr(info, "st_birthtime_ns", info.st_ctime_ns),
                         file_id=file_id,
                         mime_type=mime,
+                        name=path.name,
+                        extension="" if is_dir else _compound_suffix(path),
+                        parent_path=path.parent.relative_to(root_resolved).as_posix()
+                        if path.parent != root_resolved
+                        else "",
                         is_dir=is_dir,
                         is_placeholder=placeholder,
                         is_project_root=bool(project_markers),
+                        inside_protected_project=root_is_project,
+                        protected_project_path="" if root_is_project else relative if project_markers else "",
                         project_markers=project_markers,
                         has_build_outputs=is_dir
                         and any(
@@ -108,8 +152,19 @@ class FileSystemInventory:
                             (path / name).is_dir() for name in (".venv", "venv", "node_modules")
                         ),
                         has_nested_repositories=is_dir and _has_nested_repository(path),
+                        child_file_count=child_files,
+                        child_folder_count=child_folders,
                     )
                     results.append(item)
+                    if not is_dir:
+                        file_count += 1
+                        discovered_bytes += max(0, item.size)
+                    if progress:
+                        progress(
+                            DiscoveryProgress(
+                                len(results), file_count, discovered_bytes, relative
+                            )
+                        )
                     if is_dir and not item.is_project_root and not item.is_placeholder:
                         stack.append(path)
                 except OSError:
@@ -129,8 +184,38 @@ def _mime(path: Path) -> str:
     return mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
 
+def _compound_suffix(path: Path) -> str:
+    folded = path.name.casefold()
+    for suffix in (".synctex.gz", ".tar.gz", ".tar.bz2", ".run.xml"):
+        if folded.endswith(suffix):
+            return suffix
+    return path.suffix.casefold()
+
+
+def _child_counts(path: Path) -> tuple[int, int]:
+    files = 0
+    folders = 0
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    folders += 1
+                elif entry.is_file(follow_symlinks=False):
+                    files += 1
+    except OSError:
+        pass
+    return files, folders
+
+
 def _excluded(relative: str, patterns: Sequence[str]) -> bool:
     folded = relative.casefold()
+    if any(
+        part in {".aiorganizer-cleanup-quarantine", ".aiorganizer-quarantine"}
+        for part in folded.replace("\\", "/").split("/")
+    ):
+        return True
     return any(fnmatch.fnmatch(folded, pattern.casefold()) for pattern in patterns)
 
 
@@ -185,3 +270,16 @@ def _has_nested_repository(path: Path) -> bool:
     except OSError:
         return False
     return False
+
+
+def _project_markers(path: Path) -> tuple[str, ...]:
+    try:
+        names = {entry.name for entry in os.scandir(path)}
+    except OSError:
+        return ()
+    marker_names = {name.casefold() for name in PROJECT_MARKERS}
+    markers = {name for name in names if name.casefold() in marker_names}
+    markers.update(
+        name for name in names if name.casefold().endswith(PROJECT_MARKER_SUFFIXES)
+    )
+    return tuple(sorted(markers, key=str.casefold))

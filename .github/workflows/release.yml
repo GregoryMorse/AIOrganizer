@@ -1,8 +1,7 @@
 name: Prerelease
 
 on:
-  push:
-    tags: ["v*"]
+  # Phase-one development pause: packaging remains available on explicit request.
   workflow_dispatch:
 
 permissions:
@@ -44,7 +43,7 @@ jobs:
       - name: Install Linux Qt runtime libraries
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libegl1 libxkbcommon-x11-0
-      - run: uv sync --extra desktop --extra analysis --extra providers --extra mcp --extra release --extra dev
+      - run: uv sync --extra desktop --extra analysis --extra providers --extra mcp --extra email --extra release --extra dev
       - run: uv run pytest
       - name: Fetch verified official OCR language data
         run: uv run python packaging/fetch_tessdata.py build-resources/tesseract/tessdata
@@ -94,7 +93,7 @@ jobs:
         with:
           version: "0.9.18"
       - run: uv python install 3.12
-      - run: uv sync --extra desktop --extra analysis --extra providers --extra mcp --extra release
+      - run: uv sync --extra desktop --extra analysis --extra providers --extra mcp --extra email --extra release
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           name: macos-native-arm64
@@ -138,6 +137,7 @@ jobs:
           generate_release_notes: true
           files: release/*
           body: |
-            Unsigned AIOrganizer alpha. Use copied data first.
-            Windows SmartScreen and macOS Gatekeeper may warn about these artifacts.
+            AIOrganizer alpha. Use copied data first.
+            GitHub provenance and SBOM attestations are attached. Platform code signing remains
+            a separate credential-gated release requirement; verify the artifact's native signature.
             Cross-volume originals remain in quarantine until reviewed cleanup.

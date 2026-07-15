@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="AIOrganizer monochrome mark">
+  <rect x="28" y="28" width="456" height="456" rx="108" fill="#102A43"/>
+  <path d="M122 337V202c0-17 13-30 30-30h72l30 34h106c17 0 30 13 30 30v101c0 17-13 30-30 30H152c-17 0-30-13-30-30Z" fill="#FFFFFF"/>
+  <path d="M122 238h268" fill="none" stroke="#102A43" stroke-width="10" opacity=".28"/>
+  <g fill="#102A43"><rect x="157" y="273" width="48" height="48" rx="12"/><rect x="220" y="273" width="48" height="48" rx="12" opacity=".72"/><rect x="283" y="273" width="48" height="48" rx="12" opacity=".46"/></g>
+  <path d="M256 337v-56m-20 20 20-20 20 20" fill="none" stroke="#FFFFFF" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M377 104c5 27 17 39 44 44-27 5-39 17-44 44-5-27-17-39-44-44 27-5 39-17 44-44Z" fill="#FFFFFF"/>
+</svg>

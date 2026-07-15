@@ -75,6 +75,15 @@ class FolderCreateRequest:
     id: str = field(default_factory=lambda: new_id("folder_create"))
 
 
+@dataclass(frozen=True, slots=True)
+class CleanupRequest:
+    source: Path
+    root: Path
+    snapshot: SnapshotToken
+    cleanup_kind: str
+    id: str = field(default_factory=lambda: new_id("cleanup"))
+
+
 @dataclass(slots=True)
 class Journal:
     plan_id: str
@@ -101,6 +110,7 @@ class FileOperationEngine:
                 "kind": "rename",
                 "source": str(item.source),
                 "target": str(item.target),
+                "snapshot": item.snapshot.sha256,
                 "state": "prepared",
             }
             for item in items
@@ -134,7 +144,9 @@ class FileOperationEngine:
     def execute_folder_creates(
         self, plan_id: str, requests: Iterable[FolderCreateRequest]
     ) -> Journal:
-        items = list(requests)
+        items = sorted(requests, key=lambda request: len(request.path.parts))
+        planned: set[Path] = set()
+        target_keys: set[str] = set()
         for request in items:
             root = request.root.resolve(strict=True)
             target = request.path.resolve(strict=False)
@@ -142,8 +154,13 @@ class FileOperationEngine:
                 raise PermissionError("Folder creation escapes configured root")
             if target.exists():
                 raise FileExistsError(target)
-            if not target.parent.exists():
+            target_key = str(target).casefold()
+            if target_key in target_keys:
+                raise FileExistsError(f"Duplicate folder target: {target}")
+            target_keys.add(target_key)
+            if not target.parent.exists() and target.parent not in planned:
                 raise FileNotFoundError("Folder plans must create parents before children")
+            planned.add(target)
         journal = Journal(plan_id)
         journal.operations = [
             {"id": item.id, "kind": "folder_create", "target": str(item.path), "state": "prepared"}
@@ -192,6 +209,7 @@ class FileOperationEngine:
                 "target": str(item.target),
                 "source_root": str(item.source_root),
                 "destination_root": str(item.destination_root),
+                "snapshot": item.snapshot.sha256,
                 "state": "prepared",
             }
             for item in items
@@ -207,6 +225,8 @@ class FileOperationEngine:
                     completed.append((request, None))
                 else:
                     partial = request.target.with_name(f".aiorganizer-partial-{uuid4().hex}")
+                    journal.operations[index]["partial"] = str(partial)
+                    self._persist(journal)
                     _copy(request.source, partial)
                     if _digest(partial) != request.snapshot.sha256:
                         _remove_partial(partial)
@@ -229,7 +249,162 @@ class FileOperationEngine:
             journal.operations.append({"error": str(error), "state": "error"})
             self._persist(journal)
             self._rollback_moves(completed, journal)
+            for operation in journal.operations:
+                partial_value = operation.get("partial")
+                source_value = operation.get("source")
+                if partial_value and source_value and Path(str(source_value)).exists():
+                    _remove_partial(Path(str(partial_value)))
             raise
+
+    def execute_cleanup(
+        self, plan_id: str, requests: Iterable[CleanupRequest]
+    ) -> Journal:
+        items = list(requests)
+        self._preflight_cleanup(items)
+        journal = Journal(plan_id)
+        journal.operations = []
+        for request in items:
+            relative = request.source.resolve(strict=False).relative_to(
+                request.root.resolve(strict=False)
+            )
+            target = (
+                request.root
+                / ".AIOrganizer-Cleanup-Quarantine"
+                / journal.id
+                / relative
+            )
+            journal.operations.append(
+                {
+                    "id": request.id,
+                    "kind": "cleanup",
+                    "cleanup_kind": request.cleanup_kind,
+                    "source": str(request.source),
+                    "target": str(target),
+                    "snapshot": request.snapshot.sha256,
+                    "state": "prepared",
+                }
+            )
+        self._persist(journal)
+        completed: list[tuple[Path, Path]] = []
+        try:
+            journal.state = "executing"
+            self._persist(journal)
+            for operation in journal.operations:
+                source = Path(str(operation["source"]))
+                target = Path(str(operation["target"]))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.rename(source, target)
+                completed.append((source, target))
+                expected = str(operation.get("snapshot", ""))
+                if expected and _digest(target) != expected:
+                    raise OSError(f"Cleanup quarantine verification failed: {source}")
+                operation["state"] = "verified"
+                self._persist(journal)
+            journal.state = "completed"
+            self._persist(journal)
+            return journal
+        except Exception as error:
+            journal.state = "partially_failed"
+            journal.operations.append({"error": str(error), "state": "error"})
+            self._persist(journal)
+            for source, target in reversed(completed):
+                try:
+                    if target.exists() and not source.exists():
+                        source.parent.mkdir(parents=True, exist_ok=True)
+                        os.rename(target, source)
+                except OSError as rollback_error:
+                    journal.operations.append(
+                        {"rollback_error": str(rollback_error), "state": "recovery_required"}
+                    )
+            journal.state = (
+                "recovery_required"
+                if any("rollback_error" in operation for operation in journal.operations)
+                else "rolled_back"
+            )
+            self._persist(journal)
+            raise
+
+    def recover_incomplete(self, incomplete: Journal) -> Journal:
+        """Safely roll an interrupted journal back after inspecting observed filesystem state."""
+        if incomplete.state in {"completed", "rolled_back", "verified", "undone"}:
+            raise ValueError("Journal does not require recovery")
+        staged: list[tuple[dict[str, object], Path, Path]] = []
+        try:
+            incomplete.state = "recovering"
+            self._persist(incomplete)
+            for operation in incomplete.operations:
+                kind = str(operation.get("kind", ""))
+                if kind not in {"rename", "move", "cleanup"}:
+                    continue
+                source = Path(str(operation["source"]))
+                target = Path(str(operation["target"]))
+                partial_value = operation.get("partial")
+                if partial_value:
+                    partial = Path(str(partial_value))
+                    if partial.exists() and source.exists():
+                        _remove_partial(partial)
+                location = self._recovery_location(operation, source, target)
+                if location is None:
+                    continue
+                recovery_temp = location.with_name(f".aiorganizer-recover-{uuid4().hex}")
+                os.rename(location, recovery_temp)
+                staged.append((operation, source, recovery_temp))
+                operation["recovery_temp"] = str(recovery_temp)
+                operation["state"] = "recovery_staged"
+                self._persist(incomplete)
+            for operation, source, recovery_temp in staged:
+                if source.exists():
+                    raise FileExistsError(f"Recovery source is occupied: {source}")
+                os.rename(recovery_temp, source)
+                expected = str(operation.get("snapshot", ""))
+                if expected and _digest(source) != expected:
+                    raise OSError(f"Recovered source hash differs: {source}")
+                if operation.get("quarantine"):
+                    target = Path(str(operation["target"]))
+                    if target.exists():
+                        if expected and _digest(target) != expected:
+                            raise OSError(f"Cross-volume recovery target hash differs: {target}")
+                        _remove_partial(target)
+                operation["state"] = "rolled_back"
+                self._persist(incomplete)
+            for operation in reversed(incomplete.operations):
+                if operation.get("kind") != "folder_create":
+                    continue
+                target = Path(str(operation["target"]))
+                if target.exists():
+                    target.rmdir()
+                operation["state"] = "rolled_back"
+                self._persist(incomplete)
+            incomplete.state = "rolled_back"
+            self._persist(incomplete)
+            return incomplete
+        except Exception as error:
+            incomplete.state = "recovery_required"
+            incomplete.operations.append({"error": str(error), "state": "recovery_error"})
+            self._persist(incomplete)
+            raise
+
+    @staticmethod
+    def _recovery_location(
+        operation: dict[str, object], source: Path, target: Path
+    ) -> Path | None:
+        recovery_value = operation.get("recovery_temp")
+        if recovery_value and Path(str(recovery_value)).exists():
+            return Path(str(recovery_value))
+        quarantine_value = operation.get("quarantine")
+        if quarantine_value and Path(str(quarantine_value)).exists():
+            return Path(str(quarantine_value))
+        temporary_value = operation.get("temp")
+        if temporary_value and Path(str(temporary_value)).exists():
+            return Path(str(temporary_value))
+        state = str(operation.get("state", "prepared"))
+        if target.exists() and (state != "prepared" or not source.exists()):
+            return target
+        if source.exists():
+            return None
+        if target.exists():
+            return target
+        raise FileNotFoundError(f"Cannot locate interrupted operation source: {source}")
 
     def execute_undo(self, plan_id: str, completed: Journal) -> Journal:
         if completed.state != "completed":
@@ -241,11 +416,12 @@ class FileOperationEngine:
             if operation.get("kind")
         ]
         self._persist(undo)
-        staged: list[tuple[Path, Path, Path]] = []
+        staged: list[tuple[dict[str, object], Path, Path, Path]] = []
         undo_targets = {
             Path(str(operation["target"])).resolve(strict=False)
             for operation in undo.operations
-            if operation.get("kind") in {"rename", "move"} and not operation.get("quarantine")
+            if operation.get("kind") in {"rename", "move", "cleanup"}
+            and not operation.get("quarantine")
         }
         try:
             undo.state = "executing"
@@ -277,12 +453,15 @@ class FileOperationEngine:
                     raise OSError("Undo preconditions changed")
                 temporary = target.with_name(f".aiorganizer-undo-{uuid4().hex}")
                 os.rename(target, temporary)
-                staged.append((source, target, temporary))
+                staged.append((operation, source, target, temporary))
                 operation["temp"] = str(temporary)
                 operation["state"] = "staged"
                 self._persist(undo)
-            for source, _target, temporary in staged:
+            for operation, source, _target, temporary in staged:
                 os.rename(temporary, source)
+                expected = str(operation.get("snapshot", ""))
+                if expected and _digest(source) != expected:
+                    raise OSError(f"Undo content verification failed: {source}")
             for operation in undo.operations:
                 operation["state"] = "verified"
             undo.state = "completed"
@@ -349,6 +528,30 @@ class FileOperationEngine:
                 if free < required:
                     raise OSError("Insufficient destination space for verified cross-volume move")
 
+    def _preflight_cleanup(self, requests: list[CleanupRequest]) -> None:
+        sources: set[Path] = set()
+        for request in requests:
+            root = request.root.resolve(strict=True)
+            source = request.source.resolve(strict=True)
+            if source == root or root not in source.parents:
+                raise PermissionError("Cleanup source escapes configured root")
+            if any(
+                part.casefold()
+                in {".aiorganizer-cleanup-quarantine", ".aiorganizer-quarantine"}
+                for part in source.relative_to(root).parts
+            ):
+                raise PermissionError("Cleanup cannot quarantine an existing quarantine path")
+            if source in sources:
+                raise ValueError(f"Duplicate cleanup source: {source}")
+            if any(parent in sources for parent in source.parents):
+                raise ValueError("Cleanup sources may not overlap")
+            if any(source in existing.parents for existing in sources):
+                raise ValueError("Cleanup sources may not overlap")
+            sources.add(source)
+            issues = request.snapshot.validate()
+            if issues:
+                raise OSError(f"Stale cleanup source {request.source}: {', '.join(issues)}")
+
     def _rollback_renames(self, staged: list[tuple[RenameRequest, Path]], journal: Journal) -> None:
         for request, temp in reversed(staged):
             try:
@@ -408,13 +611,20 @@ def _same_volume(source: Path, target_parent: Path) -> bool:
 
 def _copy(source: Path, target: Path) -> None:
     if source.is_dir():
-        shutil.copytree(source, target, symlinks=True)
+        shutil.copytree(source, target, symlinks=True, copy_function=_copy_file_durable)
         return
     with source.open("rb") as source_stream, target.open("xb") as target_stream:
         shutil.copyfileobj(source_stream, target_stream, length=1024 * 1024)
         target_stream.flush()
         os.fsync(target_stream.fileno())
     shutil.copystat(source, target, follow_symlinks=False)
+
+
+def _copy_file_durable(source: str, target: str) -> str:
+    copied = shutil.copy2(source, target, follow_symlinks=False)
+    with Path(copied).open("rb") as stream:
+        os.fsync(stream.fileno())
+    return copied
 
 
 def _digest(path: Path) -> str:
@@ -428,7 +638,10 @@ def _tree_digest(path: Path) -> str:
     for child in sorted(path.rglob("*"), key=lambda item: item.as_posix().casefold()):
         relative = child.relative_to(path).as_posix()
         digest.update(relative.encode())
-        if child.is_file() and not child.is_symlink():
+        if child.is_symlink():
+            digest.update(b"symlink:")
+            digest.update(os.readlink(child).encode())
+        elif child.is_file():
             digest.update(sha256_file(child).encode())
     return digest.hexdigest()
 

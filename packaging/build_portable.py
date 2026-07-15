@@ -35,15 +35,19 @@ def main() -> int:
     for package in (
         "ai_organizer",
         "anthropic",
+        "elftools",
         "keyring",
         "lingua",
         "mcp",
         "mutagen",
+        "msal",
         "openai",
         "PIL",
         "platformdirs",
         "pydantic",
         "pypdf",
+        "rarfile",
+        "requests",
     ):
         command.append(f"--include-package={package}")
     if sys.platform != "linux":
@@ -53,6 +57,7 @@ def main() -> int:
                 "--include-package-data=codex_cli_bin",
             ]
         )
+    command.append("--include-data-dir=src/ai_organizer/resources=ai_organizer/resources")
     command.append("src/ai_organizer/bootstrap/main.py")
     environment = os.environ.copy()
     environment.setdefault("NUITKA_CACHE_DIR", str(root / ".nuitka-cache"))
@@ -71,9 +76,13 @@ def main() -> int:
     if tesseract_bundle:
         bundle_path = Path(tesseract_bundle).resolve(strict=True)
         shutil.copytree(bundle_path, build_dir / "resources" / "tesseract")
+    signing = (
+        "Platform signature verification was required by the release workflow."
+        if os.getenv("AIORGANIZER_SIGNED_BUILD") == "1"
+        else "This development artifact has no platform code signature; security warnings may appear."
+    )
     (build_dir / "ALPHA-NOTICE.txt").write_text(
-        "AIOrganizer v0.1.0 alpha is unsigned. Windows SmartScreen and macOS "
-        "Gatekeeper may warn. Test with copied data first. Cross-volume source "
+        "AIOrganizer v0.1.0 alpha. " + signing + " Test with copied data first. Cross-volume source "
         "quarantine is retained indefinitely until explicit Cleanup review.\n",
         encoding="utf-8",
     )

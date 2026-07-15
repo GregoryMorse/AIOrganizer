@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "aiorganizer": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": ["${workspaceFolder}/dev.py", "--mcp"],
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}

@@ -1,0 +1,8 @@
+:root { color-scheme: light dark; font: 16px/1.45 system-ui, sans-serif; }
+body { margin: 0; padding: 1rem; }
+main { max-width: 42rem; }
+h1 { font-size: 1.45rem; }
+button { min-height: 2.75rem; padding: .6rem 1rem; font: inherit; }
+dt { font-weight: 700; margin-top: .75rem; }
+dd { margin-left: 0; overflow-wrap: anywhere; }
+#status { border-left: .3rem solid currentColor; padding-left: .7rem; }

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 320" role="img" aria-labelledby="title desc">
+  <title id="title">AIOrganizer</title>
+  <desc id="desc">AIOrganizer logo with the structured folder and AI spark mark.</desc>
+  <defs>
+    <linearGradient id="panel" x1="34" y1="286" x2="286" y2="34" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#102A43"/><stop offset="0.55" stop-color="#155E75"/><stop offset="1" stop-color="#0F766E"/>
+    </linearGradient>
+    <linearGradient id="type" x1="360" y1="90" x2="1120" y2="250" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#102A43"/><stop offset="1" stop-color="#155E75"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="320" rx="48" fill="#F8FAFC"/>
+  <rect x="32" y="32" width="256" height="256" rx="62" fill="url(#panel)"/>
+  <path d="M83 205v-75c0-10 8-17 17-17h40l17 19h59c10 0 17 8 17 17v56c0 10-8 17-17 17H100c-9 0-17-7-17-17Z" fill="#D7FAF4"/>
+  <path d="M83 150h150v55c0 10-8 17-17 17H100c-9 0-17-7-17-17v-55Z" fill="#CCFBF1"/>
+  <g fill="#155E75"><rect x="103" y="169" width="27" height="27" rx="7"/><rect x="138" y="169" width="27" height="27" rx="7" opacity=".74"/><rect x="173" y="169" width="27" height="27" rx="7" opacity=".5"/></g>
+  <path d="M151 206v-31m-11 11 11-11 11 11" fill="none" stroke="#F0FDFA" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#FDE68A"><path d="M225 75c3 15 9 21 24 24-15 3-21 9-24 24-3-15-9-21-24-24 15-3 21-9 24-24Z"/><path d="M193 69c2 9 6 13 15 15-9 2-13 6-15 15-2-9-6-13-15-15 9-2 13-6 15-15Z" opacity=".8"/></g>
+  <text x="350" y="180" fill="url(#type)" font-family="Inter, Segoe UI, Helvetica Neue, Arial, sans-serif" font-size="96" font-weight="720" letter-spacing="-4">AIOrganizer</text>
+  <text x="356" y="229" fill="#526777" font-family="Inter, Segoe UI, Helvetica Neue, Arial, sans-serif" font-size="27" font-weight="500" letter-spacing="1.6">HUMAN-APPROVED · AI-ASSISTED ORGANIZATION</text>
+</svg>

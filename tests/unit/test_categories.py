@@ -61,3 +61,26 @@ def test_unapproved_assignment_does_not_affect_policy(tmp_path: Path) -> None:
     )
     assert not policy.category_ids
     assert not policy.roles
+
+
+def test_category_and_folder_tags_are_combined_in_effective_policy(tmp_path: Path) -> None:
+    category = CategoryDefinition(
+        "Research",
+        id="research",
+        default_tag_ids={"reference"},
+    )
+    assignment = CategoryAssignment(
+        tmp_path,
+        {"research"},
+        {FolderRole.DESTINATION},
+        tag_ids={"active"},
+    )
+
+    policy = CategoryResolver().effective_policy(
+        tmp_path / "paper.pdf",
+        [assignment],
+        {"research": category},
+        CloudPolicy.METADATA_ONLY,
+    )
+
+    assert policy.tag_ids == frozenset({"reference", "active"})

@@ -19,6 +19,9 @@ def utc_now() -> str:
 class CloudPolicy(StrEnum):
     INHERIT = "inherit"
     NONE = "none"
+    LOCAL_ONLY = "local_only"
+    METADATA_ONLY = "metadata_only"
+    CLOUD_TEXT = "cloud_text"
     TEXT_AND_IMAGES = "text_and_images"
 
 
@@ -30,10 +33,20 @@ class Sensitivity(StrEnum):
 
 class FolderRole(StrEnum):
     INBOX = "inbox"
+    DOWNLOADS = "downloads"
     DESTINATION = "destination"
     ARCHIVE = "archive"
     PROTECTED = "protected"
     EXCLUDED = "excluded"
+
+
+class TagFacet(StrEnum):
+    CONTENT = "content"
+    LIFECYCLE = "lifecycle"
+    STATE = "state"
+    ORIGIN = "origin"
+    TECHNOLOGY = "technology"
+    AUDIENCE = "audience"
 
 
 class ProposalKind(StrEnum):
@@ -41,6 +54,7 @@ class ProposalKind(StrEnum):
     FOLDER = "folder"
     MOVE = "move"
     FINDING = "finding"
+    CLEANUP = "cleanup"
 
 
 class ProposalStatus(StrEnum):
@@ -88,8 +102,10 @@ class SourceRoot:
     id: str = field(default_factory=lambda: new_id("root"))
     roles: set[FolderRole] = field(default_factory=set)
     category_ids: set[str] = field(default_factory=set)
+    tag_ids: set[str] = field(default_factory=set)
     cloud_policy: CloudPolicy = CloudPolicy.NONE
     exclusions: list[str] = field(default_factory=list)
+    max_hierarchy_depth: int | None = None
     capabilities: RootCapabilities | None = None
     policy_revision: int = 1
 
@@ -100,6 +116,7 @@ class CategoryDefinition:
     id: str = field(default_factory=lambda: new_id("cat"))
     parent_id: str | None = None
     description: str = ""
+    semantic_key: str = ""
     examples: list[str] = field(default_factory=list)
     guidance: str = ""
     sensitivity: Sensitivity = Sensitivity.NORMAL
@@ -110,8 +127,39 @@ class CategoryDefinition:
         default_factory=lambda: {FolderRole.DESTINATION, FolderRole.ARCHIVE}
     )
     preferred_destinations: dict[str, int] = field(default_factory=dict)
-    max_hierarchy_depth: int = 4
+    max_hierarchy_depth: int = 3
     permitted_kinds: set[str] = field(default_factory=set)
+    default_tag_ids: set[str] = field(default_factory=set)
+    suggest_as_folder: bool = False
+    revision: int = 1
+
+
+@dataclass(slots=True)
+class TagDefinition:
+    name: str
+    facet: TagFacet
+    id: str = field(default_factory=lambda: new_id("tag"))
+    key: str = ""
+    description: str = ""
+    aliases: list[str] = field(default_factory=list)
+    guidance: str = ""
+    applies_to: set[str] = field(
+        default_factory=lambda: {"file", "folder", "software", "email"}
+    )
+    mutually_exclusive_within_facet: bool = False
+    revision: int = 1
+
+
+@dataclass(slots=True)
+class TagAssignment:
+    entity_kind: str
+    entity_key: str
+    tag_id: str
+    id: str = field(default_factory=lambda: new_id("tag_assignment"))
+    source: str = "user"
+    confidence: float = 1.0
+    approved: bool = True
+    source_fingerprint: str = ""
     revision: int = 1
 
 
@@ -120,6 +168,7 @@ class CategoryAssignment:
     path: Path
     category_ids: set[str]
     roles: set[FolderRole]
+    tag_ids: set[str] = field(default_factory=set)
     id: str = field(default_factory=lambda: new_id("assign"))
     inherited: bool = True
     override_roles: bool = False
@@ -134,15 +183,24 @@ class ItemSnapshot:
     relative_path: str
     size: int
     modified_ns: int
+    created_ns: int | None
     file_id: str | None
     mime_type: str
+    name: str = ""
+    extension: str = ""
+    parent_path: str = ""
     is_dir: bool = False
     is_placeholder: bool = False
     is_project_root: bool = False
+    inside_protected_project: bool = False
+    protected_project_path: str = ""
     project_markers: tuple[str, ...] = ()
     has_build_outputs: bool = False
     has_virtual_environment: bool = False
     has_nested_repositories: bool = False
+    child_file_count: int = 0
+    child_folder_count: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
     sha256: str | None = None
 
 
@@ -157,6 +215,9 @@ class Evidence:
     confidence: float = 0.0
     provenance: str = "local"
     created_at: str = field(default_factory=utc_now)
+    confidence_route: str = "needs_review"
+    content_classes: list[str] = field(default_factory=lambda: ["metadata"])
+    extractor_version: str = "1"
 
 
 @dataclass(slots=True)

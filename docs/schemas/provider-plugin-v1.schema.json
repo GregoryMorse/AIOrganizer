@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aiorganizer.example/schemas/provider-plugin-v1.schema.json",
+  "title": "AIOrganizer provider plugin manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "plugin_id", "name", "version", "entry_point", "execution", "network_access", "cloud_provider", "content_classes", "capabilities", "mutation_authority"],
+  "properties": {
+    "schema": {"const": "aiorganizer.provider-plugin/v1"},
+    "plugin_id": {"type": "string", "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$", "maxLength": 100},
+    "name": {"type": "string", "minLength": 1, "maxLength": 160},
+    "version": {"type": "string"},
+    "entry_point": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$"},
+    "execution": {"const": "in_process"},
+    "network_access": {"type": "boolean"},
+    "cloud_provider": {"type": "boolean"},
+    "content_classes": {"type": "array", "uniqueItems": true, "maxItems": 4, "items": {"enum": ["metadata", "extracted_text", "images", "email_metadata"]}},
+    "capabilities": {"type": "array", "uniqueItems": true, "minItems": 2, "maxItems": 2, "items": {"enum": ["estimate", "analyze"]}},
+    "mutation_authority": {"const": false}
+  }
+}

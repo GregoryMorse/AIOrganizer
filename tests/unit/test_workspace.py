@@ -6,6 +6,13 @@ from pathlib import Path
 from ai_organizer.adapters.persistence import WorkspaceStore
 from ai_organizer.domain.models import CloudPolicy, SourceRoot
 from ai_organizer.domain.prompts import PromptLayerKind, PromptRevision
+from ai_organizer.domain.recurrence import (
+    Cadence,
+    GapStatus,
+    RecurrenceException,
+    RecurrenceSeries,
+    SeriesObservation,
+)
 
 
 def test_workspace_create_reopen_and_save_as(tmp_path: Path) -> None:
@@ -42,6 +49,36 @@ def test_v1_workspace_is_backed_up_before_migration(tmp_path: Path) -> None:
     )
     connection.close()
     store = WorkspaceStore(path)
-    assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 11
     store.close()
     assert list(tmp_path.glob("legacy.aioworkspace.backup-*"))
+
+
+def test_reviewed_recurrence_series_and_exception_survive_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "recurrence.aioworkspace"
+    store = WorkspaceStore.create(path, "Recurrence")
+    series = RecurrenceSeries(
+        "Statements",
+        "Acme",
+        "Statement",
+        "••••1234",
+        Cadence.MONTHLY,
+        "2026-01-01",
+        None,
+        10,
+        (SeriesObservation("item", "2026-01-01", 0.9, ("reviewed",)),),
+        "fingerprint",
+        id="series",
+    )
+    store.save_recurrence_series(series)
+    store.save_recurrence_exception(
+        RecurrenceException("series", "2026-02-01", GapStatus.SKIPPED, "Not applicable")
+    )
+    store.close()
+
+    reopened = WorkspaceStore(path)
+    assert reopened.list_recurrence_series()[0]["name"] == "Statements"
+    exception = reopened.list_recurrence_exceptions("series")[0]
+    assert exception["status"] == "intentionally_skipped"
+    assert exception["reason"] == "Not applicable"
+    reopened.close()

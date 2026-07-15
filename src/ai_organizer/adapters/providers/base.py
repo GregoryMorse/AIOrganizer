@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_ -]?key|token|password|secret)\s*[:=]\s*([^\s,;]+)"),
@@ -22,6 +23,22 @@ class AnalysisResult:
     findings: list[dict[str, Any]]
     usage: dict[str, int] = field(default_factory=dict)
     raw_id: str = ""
+
+
+class ProviderFinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    item_id: str = Field(min_length=1, max_length=200)
+    category: str = Field(min_length=1, max_length=100)
+    suggestion: str = Field(min_length=1, max_length=500)
+    rationale: str = Field(min_length=1, max_length=2_000)
+    confidence: float = Field(ge=0, le=1)
+
+
+class FindingsEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    findings: list[ProviderFinding] = Field(max_length=250)
 
 
 def redact(text: str) -> str:
@@ -46,38 +63,16 @@ def detect_secret_kinds(text: str) -> list[str]:
 
 def parse_findings(text: str) -> list[dict[str, Any]]:
     try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise ProviderError("Provider returned invalid structured JSON") from error
-    findings = payload.get("findings") if isinstance(payload, dict) else None
-    if not isinstance(findings, list):
-        raise ProviderError("Provider response lacks a findings array")
-    return [finding for finding in findings if isinstance(finding, dict)]
+        return [
+            finding.model_dump(mode="json")
+            for finding in FindingsEnvelope.model_validate_json(text).findings
+        ]
+    except ValidationError as error:
+        raise ProviderError("Provider response failed the strict findings schema") from error
 
 
 def finding_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "findings": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "item_id": {"type": "string"},
-                        "category": {"type": "string"},
-                        "suggestion": {"type": "string"},
-                        "rationale": {"type": "string"},
-                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    },
-                    "required": ["item_id", "category", "suggestion", "rationale", "confidence"],
-                },
-            }
-        },
-        "required": ["findings"],
-    }
+    return FindingsEnvelope.model_json_schema()
 
 
 def _mask_number_or_secret(match: re.Match[str]) -> str:

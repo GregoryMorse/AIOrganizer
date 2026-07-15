@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aiorganizer.example/schemas/outlook-handoff-v1.schema.json",
+  "title": "AIOrganizer Outlook selected-item metadata handoff v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "exportedAt", "source", "item"],
+  "properties": {
+    "schema": {"const": "aiorganizer.outlook-selection/v1"},
+    "exportedAt": {"type": "string", "maxLength": 100},
+    "source": {"const": "office-js-outlook-taskpane"},
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "item_type"],
+      "properties": {
+        "item_id": {"type": "string", "minLength": 1, "maxLength": 4000},
+        "item_type": {"enum": ["message", "appointment"]},
+        "subject": {"type": "string", "maxLength": 1000},
+        "sender": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {"type": "string", "maxLength": 320},
+            "address": {"type": "string", "maxLength": 320}
+          }
+        },
+        "received_at": {"type": "string", "maxLength": 100},
+        "attachments": {
+          "type": "array",
+          "maxItems": 250,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "name", "mime_type", "size", "is_inline"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1, "maxLength": 2000},
+              "name": {"type": "string", "maxLength": 512},
+              "mime_type": {"type": "string", "maxLength": 255},
+              "size": {"type": "integer", "minimum": 0, "maximum": 10000000000},
+              "is_inline": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

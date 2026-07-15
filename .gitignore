@@ -8,6 +8,7 @@ coverage.xml
 .ruff_cache/
 .hypothesis/
 .venv/
+.env
 .uv-cache/
 .uv-python/
 .nuitka-cache/
@@ -25,3 +26,4 @@ synthetic-corpus/
 nuitka-crash-report.xml
 .DS_Store
 Thumbs.db
+node_modules/

@@ -1,0 +1,14 @@
+{
+  "name": "aiorganizer-outlook-companion",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "description": "Metadata-only Outlook task pane companion for AIOrganizer",
+  "scripts": {
+    "start": "node dev-server.mjs",
+    "validate": "office-addin-manifest validate manifest.xml"
+  },
+  "devDependencies": {
+    "office-addin-dev-certs": "2.0.10",
+    "office-addin-manifest": "2.1.6"
+  }
+}

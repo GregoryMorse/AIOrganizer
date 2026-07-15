@@ -1,9 +1,7 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  # Phase-one development pause: retain CI, but do not run it on pushes or PRs.
   workflow_dispatch:
 
 permissions:
