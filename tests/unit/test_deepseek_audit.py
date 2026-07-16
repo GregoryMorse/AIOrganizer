@@ -5,6 +5,10 @@ from types import SimpleNamespace
 from typing import Any
 
 from ai_organizer.adapters.providers import DeepSeekProvider, OpenRouterProvider
+from ai_organizer.adapters.providers.deepseek_provider import (
+    _parse_audit_proposals,
+    _run_inventory_tool,
+)
 from ai_organizer.application.inventory_query import InventoryQueryService
 from ai_organizer.application.update_research import PublicWebResearchClient
 
@@ -66,11 +70,157 @@ def test_deepseek_audit_uses_bounded_inventory_tools_before_proposing() -> None:
     assert proposals[0]["target"] == "rename"
     assert len(completions.requests) == 2
     assert completions.requests[0]["tool_choice"] == "required"
-    assert completions.requests[0]["extra_body"] == {
-        "thinking": {"type": "disabled"}
-    }
+    assert completions.requests[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+    tool_names = {value["function"]["name"] for value in completions.requests[0]["tools"]}
+    assert {
+        "storage_list_volumes",
+        "storage_list_directory",
+        "inventory_list_file_issues",
+        "submit_audit_proposals",
+    }.issubset(tool_names)
     assert "version_regex" not in completions.requests[0]["messages"][1]["content"]
     assert any(message["role"] == "tool" for message in completions.requests[1]["messages"])
+
+
+def test_deepseek_audit_recovers_from_invalid_then_fenced_json() -> None:
+    class RecoveringCompletions:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        def create(self, **request: Any) -> Any:
+            self.requests.append(request)
+            content = (
+                "This is not JSON"
+                if len(self.requests) == 1
+                else '```json\n{"proposals":[{"target":"sources","guidance":"Use the data volume for archives","confidence":0.7}]}\n```'
+            )
+            message = SimpleNamespace(content=content, tool_calls=[])
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    completions = RecoveringCompletions()
+    provider = object.__new__(DeepSeekProvider)
+    provider.model = "deepseek-v4-flash"
+    provider._client = SimpleNamespace(  # type: ignore[attr-defined]
+        chat=SimpleNamespace(completions=completions)
+    )
+
+    proposals = provider.audit_inventory(InventoryQueryService([]), max_rounds=2)
+
+    assert proposals[0]["target"] == "sources"
+    assert len(completions.requests) == 2
+    assert any(
+        "corrected JSON only" in str(message.get("content", ""))
+        for message in completions.requests[1]["messages"]
+        if message.get("role") == "user"
+    )
+
+
+def test_deepseek_audit_accepts_strict_submission_tool() -> None:
+    class SubmissionCompletions:
+        def create(self, **request: Any) -> Any:
+            function = SimpleNamespace(
+                name="submit_audit_proposals",
+                arguments=json.dumps(
+                    {
+                        "proposals": [
+                            {
+                                "target": "sources",
+                                "pattern": "Uncovered data volume",
+                                "guidance": "Review whether the data volume needs a source.",
+                                "evidence": "Volume capacity and source coverage",
+                                "confidence": 0.75,
+                            }
+                        ]
+                    }
+                ),
+            )
+            message = SimpleNamespace(
+                content=None,
+                tool_calls=[SimpleNamespace(id="submit", function=function)],
+            )
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    provider = object.__new__(DeepSeekProvider)
+    provider.model = "deepseek-v4-flash"
+    provider._client = SimpleNamespace(  # type: ignore[attr-defined]
+        chat=SimpleNamespace(completions=SubmissionCompletions())
+    )
+
+    proposals = provider.audit_inventory(InventoryQueryService([]))
+
+    assert proposals[0]["pattern"] == "Uncovered data volume"
+
+
+def test_audit_parser_accepts_commentary_around_one_valid_json_object() -> None:
+    result = _parse_audit_proposals(
+        'Analysis complete. {"proposals":[{"target":"cleanup","guidance":"Review generated files","confidence":0.5}]} End.'
+    )
+
+    assert result[0]["target"] == "cleanup"
+
+
+def test_audit_parser_accepts_only_in_scope_source_classification() -> None:
+    result = _parse_audit_proposals(
+        json.dumps(
+            {
+                "proposals": [
+                    {
+                        "proposal_type": "source_policy",
+                        "root_id": "allowed-root",
+                        "category_ids": ["personal"],
+                        "tag_ids": ["financial"],
+                        "roles": ["archive", "invalid-role"],
+                        "pattern": "Long-lived statements",
+                        "evidence": "PDF names and timestamps",
+                        "confidence": 0.85,
+                    },
+                    {
+                        "proposal_type": "source_policy",
+                        "root_id": "outside-root",
+                        "roles": ["inbox"],
+                        "pattern": "Out of scope",
+                        "evidence": "None",
+                        "confidence": 1,
+                    },
+                ]
+            }
+        ),
+        {"allowed-root"},
+    )
+
+    assert result == [
+        {
+            "proposal_type": "source_policy",
+            "root_id": "allowed-root",
+            "target": "sources",
+            "category_ids": ["personal"],
+            "tag_ids": ["financial"],
+            "roles": ["archive"],
+            "pattern": "Long-lived statements",
+            "guidance": "",
+            "evidence": "PDF names and timestamps",
+            "confidence": 0.85,
+        }
+    ]
+
+
+def test_inventory_folder_tool_is_unlimited_when_model_omits_depth() -> None:
+    query = InventoryQueryService(
+        [
+            {
+                "id": "deep-folder",
+                "root_id": "root",
+                "relative_path": "/".join(f"level-{value}" for value in range(1, 16)),
+                "is_dir": True,
+            }
+        ]
+    )
+
+    result = _run_inventory_tool(query, "inventory_folder_tree", {}, {"root"})
+
+    assert result["max_depth"] is None
+    assert result["total"] == 1
+    assert result["folders"][0]["depth"] == 15
 
 
 class FakeFolderCompletions:
@@ -133,15 +283,11 @@ def test_deepseek_folder_plan_probes_hierarchy_and_returns_safe_paths() -> None:
 
     assert proposals[0]["projected"] == "Clients/Acme"
     assert proposals[0]["confidence"] == 0.82
-    assert completions.requests[0]["extra_body"] == {
-        "thinking": {"type": "disabled"}
-    }
-    assert any(
-        message["role"] == "tool" for message in completions.requests[1]["messages"]
-    )
+    assert completions.requests[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert any(message["role"] == "tool" for message in completions.requests[1]["messages"])
 
 
-def test_openrouter_uses_shared_tool_contract_without_deepseek_thinking_flag() -> None:
+def test_openrouter_uses_shared_tool_contract_with_zero_data_retention() -> None:
     completions = FakeFolderCompletions()
     provider = object.__new__(OpenRouterProvider)
     provider.model = "openai/gpt-5.2"
@@ -156,7 +302,7 @@ def test_openrouter_uses_shared_tool_contract_without_deepseek_thinking_flag() -
     proposals = provider.plan_folders(query, {"destination"}, {"destination"})
 
     assert proposals[0]["projected"] == "Clients/Acme"
-    assert "extra_body" not in completions.requests[0]
+    assert completions.requests[0]["extra_body"] == {"provider": {"zdr": True}}
 
 
 def test_folder_plan_discards_proposals_beyond_root_depth_ceiling() -> None:
@@ -264,9 +410,7 @@ def test_deepseek_update_research_uses_web_tool_and_strict_assessment() -> None:
     assert assessments[0].update_page_hint.version_regex
     assert assessments[0].update_page_hint.version_prefix == "Example"
     assert assessments[0].update_page_hint.version_format == "dotted_numeric"
-    assert completions.requests[0]["extra_body"] == {
-        "thinking": {"type": "disabled"}
-    }
+    assert completions.requests[0]["extra_body"] == {"thinking": {"type": "disabled"}}
     assert any(message["role"] == "tool" for message in completions.requests[1]["messages"])
 
 
@@ -313,9 +457,7 @@ def test_deepseek_update_research_returns_fetch_failure_to_model() -> None:
     )
 
     tool_result = next(
-        message
-        for message in completions.requests[1]["messages"]
-        if message["role"] == "tool"
+        message for message in completions.requests[1]["messages"] if message["role"] == "tool"
     )
     assert assessments[0].latest_version == "2.0"
     assert json.loads(tool_result["content"])["recoverable"] is True
@@ -348,9 +490,7 @@ class DiscoveryBudgetCompletions(FakeUpdateCompletions):
                     ]
                 }
             )
-            function = SimpleNamespace(
-                name="submit_update_assessments", arguments=arguments
-            )
+            function = SimpleNamespace(name="submit_update_assessments", arguments=arguments)
             message = SimpleNamespace(
                 content=None,
                 tool_calls=[SimpleNamespace(id="submit", function=function)],
@@ -392,9 +532,7 @@ def test_deepseek_update_research_forces_final_result_after_discovery_budget() -
 
     assert assessments[0].result_status == "not_found"
     assert completions.requests[-1]["tool_choice"] == "required"
-    assert completions.requests[-1]["tools"][0]["function"]["name"] == (
-        "submit_update_assessments"
-    )
+    assert completions.requests[-1]["tools"][0]["function"]["name"] == ("submit_update_assessments")
 
 
 def test_deepseek_update_research_accepts_single_assessment_envelope() -> None:

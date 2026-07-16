@@ -66,9 +66,7 @@ def configure_data_tree(tree: QTreeWidget, *, sortable: bool = True) -> None:
 
 
 def selected_table_rows(table: QTableView, model: DictTableModel) -> list[dict[str, Any]]:
-    indexes = sorted(
-        {index.row() for index in table.selectionModel().selectedRows()}
-    )
+    indexes = sorted({index.row() for index in table.selectionModel().selectedRows()})
     return [model.rows[index] for index in indexes if 0 <= index < len(model.rows)]
 
 

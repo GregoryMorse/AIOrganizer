@@ -22,9 +22,9 @@ class ProviderPluginManifestV1(BaseModel):
     execution: Literal["in_process"]
     network_access: bool
     cloud_provider: bool
-    content_classes: list[
-        Literal["metadata", "extracted_text", "images", "email_metadata"]
-    ] = Field(max_length=4)
+    content_classes: list[Literal["metadata", "extracted_text", "images", "email_metadata"]] = (
+        Field(max_length=4)
+    )
     capabilities: list[Literal["estimate", "analyze"]] = Field(min_length=2, max_length=2)
     mutation_authority: Literal[False]
 

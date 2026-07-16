@@ -65,7 +65,9 @@ class EmailService:
         *,
         include_attachment_metadata: bool = True,
     ) -> dict[str, int]:
-        folders = [replace(folder, account_id=account.id) for folder in self.graph.list_folders(token)]
+        folders = [
+            replace(folder, account_id=account.id) for folder in self.graph.list_folders(token)
+        ]
         self.store.save_mail_folders(folders)
         selected = folder_ids or tuple(folder.id for folder in folders)
         messages_seen = 0
@@ -162,9 +164,20 @@ class EmailService:
         if account is None:
             raise RuntimeError("No active email account")
         payloads = self.store.list_email_proposals(account.id)
-        proposals = [_proposal_from_payload(value) for value in payloads if value["id"] in proposal_ids]
+        proposals = [
+            _proposal_from_payload(value) for value in payloads if value["id"] in proposal_ids
+        ]
         if {proposal.id for proposal in proposals} != proposal_ids:
             raise ValueError("One or more selected email proposals no longer exist")
+        folder_targets = [
+            str(proposal.payload["folder_id"])
+            for proposal in proposals
+            if proposal.kind in {EmailProposalKind.FOLDER_RENAME, EmailProposalKind.FOLDER_MOVE}
+        ]
+        if len(folder_targets) != len(set(folder_targets)):
+            raise ValueError(
+                "Apply at most one rename or move proposal per mail folder in each batch"
+            )
         review = permission_review(proposals, tuple(granted_scopes))
         if review.additional_scopes:
             raise PermissionError(
@@ -174,7 +187,9 @@ class EmailService:
         for proposal in proposals:
             proposal.validate()
             if proposal.status not in {EmailProposalStatus.ACCEPTED, EmailProposalStatus.PROPOSED}:
-                raise ValueError(f"Proposal {proposal.id} is not applicable in state {proposal.status}")
+                raise ValueError(
+                    f"Proposal {proposal.id} is not applicable in state {proposal.status}"
+                )
             try:
                 result = self._apply_one(token, proposal)
             except RemoteConflict:
@@ -195,7 +210,9 @@ class EmailService:
         return results
 
     def active_account(self) -> EmailAccount | None:
-        payload = next((value for value in self.store.list_email_accounts() if value["active"]), None)
+        payload = next(
+            (value for value in self.store.list_email_accounts() if value["active"]), None
+        )
         return _account_from_payload(payload) if payload else None
 
     def recurring_attachment_matches(
@@ -225,6 +242,24 @@ class EmailService:
                 token,
                 str(proposal.payload["parent_folder_id"]),
                 str(proposal.payload["display_name"]),
+            )
+        if proposal.kind == EmailProposalKind.FOLDER_RENAME:
+            return self.graph.rename_folder(
+                token,
+                str(proposal.payload["folder_id"]),
+                str(proposal.payload["display_name"]),
+                expected_display_name=str(proposal.expected_remote["display_name"]),
+                expected_parent_folder_id=str(proposal.expected_remote["parent_folder_id"]),
+                expected_etag=str(proposal.expected_remote.get("etag", "")),
+            )
+        if proposal.kind == EmailProposalKind.FOLDER_MOVE:
+            return self.graph.move_folder(
+                token,
+                str(proposal.payload["folder_id"]),
+                str(proposal.payload["destination_folder_id"]),
+                expected_display_name=str(proposal.expected_remote["display_name"]),
+                expected_parent_folder_id=str(proposal.expected_remote["parent_folder_id"]),
+                expected_etag=str(proposal.expected_remote.get("etag", "")),
             )
         if proposal.kind == EmailProposalKind.MESSAGE_MOVE:
             return self.graph.move_message(

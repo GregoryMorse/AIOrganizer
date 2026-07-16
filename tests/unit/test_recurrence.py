@@ -42,9 +42,7 @@ def test_period_and_cadence_detection_support_common_period_tokens() -> None:
     assert parse_period("Statement 2026-04.pdf") == date(2026, 4, 1)
     assert parse_period("Statement 2026Q3.pdf") == date(2026, 7, 1)
     assert parse_period("Statement March 2026.pdf") == date(2026, 3, 1)
-    cadence, confidence = detect_cadence(
-        [date(2026, 1, 1), date(2026, 2, 1), date(2026, 3, 1)]
-    )
+    cadence, confidence = detect_cadence([date(2026, 1, 1), date(2026, 2, 1), date(2026, 3, 1)])
     assert cadence == Cadence.MONTHLY
     assert confidence == 1.0
 

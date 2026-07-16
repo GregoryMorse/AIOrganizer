@@ -35,7 +35,9 @@ class MsalDeviceAuth:
         try:
             import msal
         except ImportError as error:
-            raise RuntimeError("Install the optional email dependencies: uv sync --extra email") from error
+            raise RuntimeError(
+                "Install the optional email dependencies: uv sync --extra email"
+            ) from error
         self._msal = msal
         self._cache = msal.SerializableTokenCache()
         cached = self._load_cache()
@@ -55,8 +57,7 @@ class MsalDeviceAuth:
         count_value = self.secrets.get(f"{self._cache_name}:chunks")
         if count_value and count_value.isdigit():
             parts = [
-                self.secrets.get(f"{self._cache_name}:{index}")
-                for index in range(int(count_value))
+                self.secrets.get(f"{self._cache_name}:{index}") for index in range(int(count_value))
             ]
             if all(part is not None for part in parts):
                 return "".join(str(part) for part in parts)

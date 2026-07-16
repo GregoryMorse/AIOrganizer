@@ -256,9 +256,7 @@ class FileOperationEngine:
                     _remove_partial(Path(str(partial_value)))
             raise
 
-    def execute_cleanup(
-        self, plan_id: str, requests: Iterable[CleanupRequest]
-    ) -> Journal:
+    def execute_cleanup(self, plan_id: str, requests: Iterable[CleanupRequest]) -> Journal:
         items = list(requests)
         self._preflight_cleanup(items)
         journal = Journal(plan_id)
@@ -267,12 +265,7 @@ class FileOperationEngine:
             relative = request.source.resolve(strict=False).relative_to(
                 request.root.resolve(strict=False)
             )
-            target = (
-                request.root
-                / ".AIOrganizer-Cleanup-Quarantine"
-                / journal.id
-                / relative
-            )
+            target = request.root / ".AIOrganizer-Cleanup-Quarantine" / journal.id / relative
             journal.operations.append(
                 {
                     "id": request.id,
@@ -385,9 +378,7 @@ class FileOperationEngine:
             raise
 
     @staticmethod
-    def _recovery_location(
-        operation: dict[str, object], source: Path, target: Path
-    ) -> Path | None:
+    def _recovery_location(operation: dict[str, object], source: Path, target: Path) -> Path | None:
         recovery_value = operation.get("recovery_temp")
         if recovery_value and Path(str(recovery_value)).exists():
             return Path(str(recovery_value))
@@ -536,8 +527,7 @@ class FileOperationEngine:
             if source == root or root not in source.parents:
                 raise PermissionError("Cleanup source escapes configured root")
             if any(
-                part.casefold()
-                in {".aiorganizer-cleanup-quarantine", ".aiorganizer-quarantine"}
+                part.casefold() in {".aiorganizer-cleanup-quarantine", ".aiorganizer-quarantine"}
                 for part in source.relative_to(root).parts
             ):
                 raise PermissionError("Cleanup cannot quarantine an existing quarantine path")

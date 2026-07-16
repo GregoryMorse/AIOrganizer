@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import platform
 import shutil
 import struct
 import subprocess
 import tarfile
+import threading
+import warnings
 import zipfile
 import zlib
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -60,6 +63,7 @@ EXECUTABLE_MIME_TYPES = {
     "application/x-pie-executable",
     "application/x-sharedlib",
 }
+_PDF_DIAGNOSTIC_LOCK = threading.Lock()
 
 
 class MetadataIndexer:
@@ -74,6 +78,8 @@ class MetadataIndexer:
             "modified_ns": item.modified_ns,
             "created_ns": item.created_ns,
             "is_directory": item.is_dir,
+            "file_health_status": "no_issues_observed",
+            "file_health_issue_count": 0,
         }
         with suppress(OSError):
             facts.update(_filesystem_metadata(path))
@@ -130,18 +136,37 @@ class MetadataIndexer:
                 suffix in PE_SUFFIXES
                 or suffix in UNIX_BINARY_SUFFIXES
                 or item.mime_type in EXECUTABLE_MIME_TYPES
-                or (
-                platform.system() != "Windows" and os.access(path, os.X_OK)
-                )
+                or (platform.system() != "Windows" and os.access(path, os.X_OK))
             ):
                 facts.update(_executable_metadata(path))
         except Exception as error:
             facts["metadata_error"] = type(error).__name__
+            facts["metadata_error_detail"] = str(error)[:500]
+            facts["file_health_status"] = "error"
+            facts["file_health_issue_count"] = 1
+            facts["file_health_issues"] = [
+                {
+                    "code": "metadata_extraction_error",
+                    "severity": "error",
+                    "source": "metadata_indexer",
+                    "message": f"{type(error).__name__}: {str(error)[:400]}",
+                    "interpretation": "The parser could not inspect this file; this is not proof of data loss.",
+                }
+            ]
         return facts
 
 
 def metadata_fingerprint(item: ItemSnapshot) -> str:
     return f"{item.size}:{item.modified_ns}"
+
+
+def metadata_cache_compatible(item: ItemSnapshot, payload: dict[str, Any]) -> bool:
+    """Refresh only formats whose extraction contract gained required durable fields."""
+    return not (
+        not item.is_dir
+        and (item.extension or Path(item.relative_path).suffix).casefold() == ".pdf"
+        and "file_health_status" not in payload
+    )
 
 
 def content_fingerprint(path: Path, algorithm: str) -> dict[str, Any]:
@@ -252,17 +277,94 @@ def _sampled_text_metadata(path: Path, size: int) -> dict[str, Any]:
 def _pdf_metadata(path: Path) -> dict[str, Any]:
     from pypdf import PdfReader
 
-    reader = PdfReader(path)
-    encrypted = bool(reader.is_encrypted)
+    with capture_pdf_diagnostics() as messages:
+        reader = PdfReader(path, strict=False)
+        encrypted = bool(reader.is_encrypted)
+        page_count = None if encrypted else len(reader.pages)
+        properties = (
+            {str(key).lstrip("/"): str(value) for key, value in (reader.metadata or {}).items()}
+            if not encrypted
+            else {}
+        )
+    issues = pdf_health_issues(messages)
     return {
         "encrypted": encrypted,
-        "page_count": None if encrypted else len(reader.pages),
-        "document_properties": {
-            str(key).lstrip("/"): str(value) for key, value in (reader.metadata or {}).items()
-        }
-        if not encrypted
-        else {},
+        "page_count": page_count,
+        "document_properties": properties,
+        "file_health_status": "warning" if issues else "no_issues_observed",
+        "file_health_issue_count": len(issues),
+        "file_health_issues": issues,
     }
+
+
+class _MessageCapture(logging.Handler):
+    def __init__(self, messages: list[str]) -> None:
+        super().__init__(logging.WARNING)
+        self.messages = messages
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+@contextmanager
+def capture_pdf_diagnostics():  # type: ignore[no-untyped-def]
+    """Capture pypdf diagnostics without allowing worker threads to print them."""
+    messages: list[str] = []
+    handler = _MessageCapture(messages)
+    logger = logging.getLogger("pypdf")
+    with _PDF_DIAGNOSTIC_LOCK:
+        old_level = logger.level
+        old_propagate = logger.propagate
+        logger.addHandler(handler)
+        logger.setLevel(logging.WARNING)
+        logger.propagate = False
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                yield messages
+                messages.extend(str(value.message) for value in caught)
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
+            logger.propagate = old_propagate
+
+
+def pdf_health_issues(messages: list[str]) -> list[dict[str, str]]:
+    result = []
+    seen: set[tuple[str, str]] = set()
+    patterns = (
+        ("multiple definitions in dictionary", "pdf_duplicate_dictionary_key"),
+        ("wrong pointing object", "pdf_broken_object_reference"),
+        ("invalid pdf header", "pdf_nonstandard_header"),
+        ("incorrect startxref", "pdf_incorrect_startxref"),
+        ("xref table not zero-indexed", "pdf_nonstandard_xref"),
+        ("object id", "pdf_object_reference_warning"),
+    )
+    for raw in messages:
+        message = " ".join(str(raw).split())[:500]
+        if not message:
+            continue
+        folded = message.casefold()
+        code = next((value for needle, value in patterns if needle in folded), "pdf_parser_warning")
+        identity = (code, message)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(
+            {
+                "code": code,
+                "severity": "warning",
+                "source": "pypdf",
+                "message": message,
+                "interpretation": (
+                    "The parser recovered, but the PDF structure is nonstandard or inconsistent; "
+                    "verify the document visually before acting on extracted metadata."
+                ),
+            }
+        )
+        if len(result) >= 50:
+            break
+    return result
 
 
 def _office_metadata(path: Path, suffix: str) -> dict[str, Any]:
@@ -423,7 +525,7 @@ def _archive_metadata(path: Path) -> dict[str, Any]:
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as archive:
             infos = archive.infolist()
-            members = [_zip_member(info) for info in infos[:_archive_member_limit()]]
+            members = [_zip_member(info) for info in infos[: _archive_member_limit()]]
             return {
                 "archive_format": "zip",
                 "archive_entry_count": len(infos),
@@ -439,7 +541,7 @@ def _archive_metadata(path: Path) -> dict[str, Any]:
     if tarfile.is_tarfile(path):
         with tarfile.open(path) as archive:
             members = archive.getmembers()
-            member_rows = [_tar_member(member) for member in members[:_archive_member_limit()]]
+            member_rows = [_tar_member(member) for member in members[: _archive_member_limit()]]
             return {
                 "archive_format": "tar",
                 "archive_entry_count": len(members),
@@ -484,7 +586,7 @@ def _rar_metadata(path: Path) -> dict[str, Any]:
         }
     with rarfile.RarFile(path) as archive:
         infos = archive.infolist()
-        rows = [_rar_member(info) for info in infos[:_archive_member_limit()]]
+        rows = [_rar_member(info) for info in infos[: _archive_member_limit()]]
         return {
             "archive_format": "rar",
             "archive_entry_count": len(infos),
@@ -539,7 +641,9 @@ def _iso_datetime(value: Any) -> str:
 
 def _archive_member_limit() -> int:
     try:
-        return max(1_000, min(250_000, int(os.getenv("AIORGANIZER_ARCHIVE_MEMBER_LIMIT", "100000"))))
+        return max(
+            1_000, min(250_000, int(os.getenv("AIORGANIZER_ARCHIVE_MEMBER_LIMIT", "100000")))
+        )
     except ValueError:
         return 100_000
 
@@ -612,13 +716,17 @@ def _pe_header_metadata(path: Path) -> dict[str, Any]:
     if len(optional) < 70:
         return result
     magic = struct.unpack_from("<H", optional)[0]
-    result["pe_kind"] = {0x10B: "PE32", 0x20B: "PE32+", 0x107: "ROM"}.get(
-        magic, f"0x{magic:04x}"
-    )
+    result["pe_kind"] = {0x10B: "PE32", 0x20B: "PE32+", 0x107: "ROM"}.get(magic, f"0x{magic:04x}")
     result["linker_version"] = f"{optional[2]}.{optional[3]}"
-    result["operating_system_version"] = f"{struct.unpack_from('<H', optional, 40)[0]}.{struct.unpack_from('<H', optional, 42)[0]}"
-    result["image_version"] = f"{struct.unpack_from('<H', optional, 44)[0]}.{struct.unpack_from('<H', optional, 46)[0]}"
-    result["subsystem_version"] = f"{struct.unpack_from('<H', optional, 48)[0]}.{struct.unpack_from('<H', optional, 50)[0]}"
+    result["operating_system_version"] = (
+        f"{struct.unpack_from('<H', optional, 40)[0]}.{struct.unpack_from('<H', optional, 42)[0]}"
+    )
+    result["image_version"] = (
+        f"{struct.unpack_from('<H', optional, 44)[0]}.{struct.unpack_from('<H', optional, 46)[0]}"
+    )
+    result["subsystem_version"] = (
+        f"{struct.unpack_from('<H', optional, 48)[0]}.{struct.unpack_from('<H', optional, 50)[0]}"
+    )
     subsystem = struct.unpack_from("<H", optional, 68)[0]
     result["subsystem"] = subsystems.get(subsystem, str(subsystem))
     if len(optional) >= 72:
@@ -637,18 +745,41 @@ def _windows_version_metadata(path: Path) -> dict[str, Any]:
     from ctypes import wintypes
 
     class VSFixedFileInfo(ctypes.Structure):
-        _fields_ = [(name, wintypes.DWORD) for name in (
-            "signature", "struct_version", "file_version_ms", "file_version_ls",
-            "product_version_ms", "product_version_ls", "file_flags_mask", "file_flags",
-            "file_os", "file_type", "file_subtype", "file_date_ms", "file_date_ls",
-        )]
+        _fields_ = [
+            (name, wintypes.DWORD)
+            for name in (
+                "signature",
+                "struct_version",
+                "file_version_ms",
+                "file_version_ls",
+                "product_version_ms",
+                "product_version_ls",
+                "file_flags_mask",
+                "file_flags",
+                "file_os",
+                "file_type",
+                "file_subtype",
+                "file_date_ms",
+                "file_date_ls",
+            )
+        ]
 
     version = ctypes.windll.version
     version.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
     version.GetFileVersionInfoSizeW.restype = wintypes.DWORD
-    version.GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+    version.GetFileVersionInfoW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
     version.GetFileVersionInfoW.restype = wintypes.BOOL
-    version.VerQueryValueW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.UINT)]
+    version.VerQueryValueW.argtypes = [
+        ctypes.c_void_p,
+        wintypes.LPCWSTR,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.UINT),
+    ]
     version.VerQueryValueW.restype = wintypes.BOOL
 
     ignored = wintypes.DWORD()
@@ -661,17 +792,25 @@ def _windows_version_metadata(path: Path) -> dict[str, Any]:
     pointer = ctypes.c_void_p()
     length = wintypes.UINT()
     result: dict[str, Any] = {"portable_executable": True, "version_resource_available": True}
-    if version.VerQueryValueW(buffer, "\\", ctypes.byref(pointer), ctypes.byref(length)) and length.value >= ctypes.sizeof(VSFixedFileInfo):
+    if version.VerQueryValueW(
+        buffer, "\\", ctypes.byref(pointer), ctypes.byref(length)
+    ) and length.value >= ctypes.sizeof(VSFixedFileInfo):
         fixed = ctypes.cast(pointer, ctypes.POINTER(VSFixedFileInfo)).contents
         if fixed.signature == 0xFEEF04BD:
-            result.update({
-                "fixed_file_version": _quad_version(fixed.file_version_ms, fixed.file_version_ls),
-                "fixed_product_version": _quad_version(fixed.product_version_ms, fixed.product_version_ls),
-                "version_file_flags": f"0x{fixed.file_flags:08x}",
-                "version_file_os": f"0x{fixed.file_os:08x}",
-                "version_file_type": fixed.file_type,
-                "version_file_subtype": fixed.file_subtype,
-            })
+            result.update(
+                {
+                    "fixed_file_version": _quad_version(
+                        fixed.file_version_ms, fixed.file_version_ls
+                    ),
+                    "fixed_product_version": _quad_version(
+                        fixed.product_version_ms, fixed.product_version_ls
+                    ),
+                    "version_file_flags": f"0x{fixed.file_flags:08x}",
+                    "version_file_os": f"0x{fixed.file_os:08x}",
+                    "version_file_type": fixed.file_type,
+                    "version_file_subtype": fixed.file_subtype,
+                }
+            )
     translations: list[tuple[int, int]] = []
     if (
         version.VerQueryValueW(
@@ -680,11 +819,15 @@ def _windows_version_metadata(path: Path) -> dict[str, Any]:
         and length.value >= 4
     ):
         values = ctypes.cast(pointer, ctypes.POINTER(ctypes.c_ushort))
-        translations = [(values[index], values[index + 1]) for index in range(0, length.value // 2, 2)]
+        translations = [
+            (values[index], values[index + 1]) for index in range(0, length.value // 2, 2)
+        ]
     for fallback in ((0x0409, 0x04B0), (0x0409, 0x04E4), (0, 0x04B0), (0, 0x04E4)):
         if fallback not in translations:
             translations.append(fallback)
-    result["version_translations"] = [f"{language:04x}{codepage:04x}" for language, codepage in translations]
+    result["version_translations"] = [
+        f"{language:04x}{codepage:04x}" for language, codepage in translations
+    ]
     for language, codepage in translations:
         prefix = f"\\StringFileInfo\\{language:04x}{codepage:04x}\\"
         for key in (
@@ -702,7 +845,9 @@ def _windows_version_metadata(path: Path) -> dict[str, Any]:
             "SpecialBuild",
         ):
             if key not in result and (
-                version.VerQueryValueW(buffer, prefix + key, ctypes.byref(pointer), ctypes.byref(length))
+                version.VerQueryValueW(
+                    buffer, prefix + key, ctypes.byref(pointer), ctypes.byref(length)
+                )
                 and length.value
             ):
                 result[key] = ctypes.wstring_at(pointer, length.value).rstrip("\x00")
@@ -802,7 +947,9 @@ def _msix_metadata(path: Path) -> dict[str, Any]:
             None,
         )
         if identity is not None:
-            result["package_identity"] = {str(key): str(value) for key, value in identity.attrib.items()}
+            result["package_identity"] = {
+                str(key): str(value) for key, value in identity.attrib.items()
+            }
         result["package_properties"] = {
             element.tag.rsplit("}", 1)[-1]: (element.text or "").strip()
             for element in root.iter()
@@ -902,7 +1049,12 @@ def _elf_header_metadata(path: Path) -> dict[str, Any]:
 
 def _macho_metadata(path: Path) -> dict[str, Any]:
     magic = _read_prefix(path, 4)
-    if magic in {b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}:
+    if magic in {
+        b"\xca\xfe\xba\xbe",
+        b"\xbe\xba\xfe\xca",
+        b"\xca\xfe\xba\xbf",
+        b"\xbf\xba\xfe\xca",
+    }:
         return _fat_macho_metadata(path, magic)
     endian = "<" if magic in {b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"} else ">"
     is_64 = magic in {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"}
@@ -949,7 +1101,9 @@ def _macho_metadata(path: Path) -> dict[str, Any]:
         elif command == 0xD and len(data) >= 24:
             name_offset, _, current, compatibility = struct.unpack_from(endian + "IIII", data, 8)
             if 0 < name_offset < len(data):
-                result["dylib_install_name"] = data[name_offset:].split(b"\0", 1)[0].decode("utf-8", errors="replace")
+                result["dylib_install_name"] = (
+                    data[name_offset:].split(b"\0", 1)[0].decode("utf-8", errors="replace")
+                )
             result["dylib_current_version"] = _packed_version(current)
             result["dylib_compatibility_version"] = _packed_version(compatibility)
         offset += size
@@ -969,11 +1123,27 @@ def _fat_macho_metadata(path: Path, magic: bytes) -> dict[str, Any]:
     for index in range(count):
         offset = index * record_size
         if is_64:
-            cpu, subtype, file_offset, size, align, _ = struct.unpack_from(endian + "iiQQII", records, offset)
+            cpu, subtype, file_offset, size, align, _ = struct.unpack_from(
+                endian + "iiQQII", records, offset
+            )
         else:
-            cpu, subtype, file_offset, size, align = struct.unpack_from(endian + "iiIII", records, offset)
-        architectures.append({"cpu_type": cpu, "cpu_subtype": subtype, "offset": file_offset, "size": size, "align": align})
-    return {"binary_format": "mach-o-fat", "architecture_count": count, "architectures": architectures}
+            cpu, subtype, file_offset, size, align = struct.unpack_from(
+                endian + "iiIII", records, offset
+            )
+        architectures.append(
+            {
+                "cpu_type": cpu,
+                "cpu_subtype": subtype,
+                "offset": file_offset,
+                "size": size,
+                "align": align,
+            }
+        )
+    return {
+        "binary_format": "mach-o-fat",
+        "architecture_count": count,
+        "architectures": architectures,
+    }
 
 
 def _packed_version(value: int) -> str:
@@ -981,7 +1151,16 @@ def _packed_version(value: int) -> str:
 
 
 def _source_version(value: int) -> str:
-    return ".".join(str(part) for part in ((value >> 40) & 0xFFFFFF, (value >> 30) & 0x3FF, (value >> 20) & 0x3FF, (value >> 10) & 0x3FF, value & 0x3FF))
+    return ".".join(
+        str(part)
+        for part in (
+            (value >> 40) & 0xFFFFFF,
+            (value >> 30) & 0x3FF,
+            (value >> 20) & 0x3FF,
+            (value >> 10) & 0x3FF,
+            value & 0x3FF,
+        )
+    )
 
 
 def _xml_leaf_values(data: bytes) -> dict[str, str]:

@@ -24,6 +24,7 @@ from ai_organizer.adapters.filesystem import (
     MetadataIndexer,
     ScanCancelled,
     content_fingerprint,
+    metadata_cache_compatible,
     metadata_fingerprint,
 )
 from ai_organizer.application.services import InventoryRun
@@ -115,9 +116,7 @@ class InventoryScanWorker(QObject):
                 runs.append(InventoryRun(new_id("snapshot"), source.id, tuple(items)))
 
             total_items = sum(len(run.items) for run in runs)
-            total_bytes = sum(
-                item.size for run in runs for item in run.items if not item.is_dir
-            )
+            total_bytes = sum(item.size for run in runs for item in run.items if not item.is_dir)
             processed_items = 0
             processed_bytes = 0
             metadata_updates: dict[tuple[str, str], dict[str, Any]] = {}
@@ -140,8 +139,8 @@ class InventoryScanWorker(QObject):
                     if self._cancelled:
                         raise ScanCancelled("Inventory scan cancelled")
                     key = (item.root_id, item.relative_path)
-                    metadata = self._cached(item, source.path / item.relative_path)
                     source = sources_by_id[item.root_id]
+                    metadata = self._cached(item, source.path / item.relative_path)
                     if metadata is not None:
                         metadata_by_key[key] = metadata
                     else:
@@ -225,6 +224,8 @@ class InventoryScanWorker(QObject):
         if not record or record.get("fingerprint") != metadata_fingerprint(item):
             return None
         payload = dict(record.get("payload", {}))
+        if not metadata_cache_compatible(item, payload):
+            return None
         if self.fingerprint_mode in {"crc32", "sha256"}:
             stored = payload.get("content_fingerprint", {})
             if stored.get("algorithm") != self.fingerprint_mode:

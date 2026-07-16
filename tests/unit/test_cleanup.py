@@ -33,9 +33,7 @@ def test_empty_folder_and_manifest_backed_artifacts_are_distinct(tmp_path: Path)
         },
     ]
 
-    candidates = CleanupAnalyzer().analyze(
-        "root", root, items, move_created_empty_paths={empty}
-    )
+    candidates = CleanupAnalyzer().analyze("root", root, items, move_created_empty_paths={empty})
     lookup = {candidate.relative_path: candidate for candidate in candidates}
 
     assert lookup["old-empty"].kind == CleanupKind.EMPTY_FOLDER
@@ -85,9 +83,7 @@ def test_active_or_recent_partial_is_not_proposed(tmp_path: Path) -> None:
         }
         for path in (active, old, recent)
     ]
-    candidates = CleanupAnalyzer().analyze(
-        "root", root, items, active_operation_paths={active}
-    )
+    candidates = CleanupAnalyzer().analyze("root", root, items, active_operation_paths={active})
     partials = {
         candidate.relative_path
         for candidate in candidates

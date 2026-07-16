@@ -17,6 +17,9 @@ RESERVED_WINDOWS = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+_INSTRUCTIONAL_FILENAME = re.compile(
+    r"(?i)^\s*(?:classify|categorize|rename|move|save)\s+(?:this\s+|it\s+)?(?:as|to)\b"
+)
 
 
 @dataclass(slots=True)
@@ -105,6 +108,28 @@ def disambiguate(names: list[str]) -> list[str]:
         path = Path(name)
         output.append(f"{path.stem} - {count:02d}{path.suffix}")
     return output
+
+
+def valid_filename_proposal(current_name: str, proposed_name: str) -> bool:
+    """Accept a filename component, never an instruction or prose response."""
+    value = proposed_name.strip()
+    if (
+        not value
+        or len(value) > 240
+        or value != proposed_name
+        or Path(value).name != value
+        or INVALID_WINDOWS.search(value)
+        or value.endswith((" ", "."))
+        or value.startswith(("`", '"', "'"))
+        or value.endswith(("`", '"', "'"))
+        or _INSTRUCTIONAL_FILENAME.search(value)
+    ):
+        return False
+    path = Path(value)
+    current = Path(current_name)
+    if path.suffix.casefold() != current.suffix.casefold():
+        return False
+    return path.stem.upper() not in RESERVED_WINDOWS
 
 
 def _apply_case(value: str, style: str) -> str:

@@ -114,9 +114,7 @@ def _write_bundle(target: Path, bundle_format: str, documents: dict[str, Any]) -
     partial = target.with_name(f".{target.name}.partial")
     encoded: dict[str, bytes] = {}
     for name, value in documents.items():
-        text = json.dumps(
-            _redact_value(value), ensure_ascii=False, indent=2, sort_keys=True
-        )
+        text = json.dumps(_redact_value(value), ensure_ascii=False, indent=2, sort_keys=True)
         encoded[name] = text.encode("utf-8")
     manifest = {
         "format": bundle_format,

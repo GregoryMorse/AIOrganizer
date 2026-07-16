@@ -25,9 +25,11 @@ from ai_organizer.adapters.filesystem import (
     SnapshotToken,
     content_fingerprint,
     journal_to_dict,
+    metadata_cache_compatible,
     metadata_fingerprint,
 )
 from ai_organizer.adapters.persistence import WorkspaceStore
+from ai_organizer.adapters.secrets import SecretStore
 from ai_organizer.adapters.software_inventory import SoftwareInventory
 from ai_organizer.application.services import InventoryService
 from ai_organizer.bootstrap.workspace_locator import publish_active_workspace
@@ -52,6 +54,7 @@ from ai_organizer.domain.models import (
     new_id,
 )
 from ai_organizer.domain.moves import MoveCandidate, ProjectedMoveValidator
+from ai_organizer.domain.naming import valid_filename_proposal
 from ai_organizer.domain.organization import (
     FolderDepthPolicy,
     general_organization_profile,
@@ -148,7 +151,7 @@ class WorkspaceController(QObject):
         candidate = SourceRoot(
             path.resolve(strict=True),
             path.name or str(path),
-            roles=roles or {FolderRole.INBOX},
+            roles=set() if roles is None else set(roles),
             cloud_policy=cloud_policy,
             category_ids=category_ids or set(),
             tag_ids=tag_ids or set(),
@@ -162,6 +165,56 @@ class WorkspaceController(QObject):
         self.store.activity("source.added", f"Added source {candidate.name}")
         self.workspace_changed.emit()
         return candidate
+
+    def source_is_classified(self, root_id: str) -> bool:
+        source = self.sources.get(root_id)
+        return bool(source and (source.roles or source.category_ids or source.tag_ids))
+
+    def source_is_operational(self, root_id: str) -> bool:
+        """Return whether a reviewed source may be offered to operational tools."""
+        source = self.sources.get(root_id)
+        return bool(
+            source
+            and self.source_is_classified(root_id)
+            and FolderRole.EXCLUDED not in source.roles
+        )
+
+    def set_source_classification(
+        self,
+        root_id: str,
+        category_ids: set[str],
+        tag_ids: set[str],
+        roles: set[FolderRole],
+    ) -> None:
+        """Replace one source's approved classification after explicit user review."""
+        if not self.store:
+            raise RuntimeError("Open a workspace first")
+        source = self.sources.get(root_id)
+        if source is None:
+            raise ValueError("Unknown source root")
+        known_categories = {str(value["id"]) for value in self.store.list_category_payloads()}
+        known_tags = {str(value["id"]) for value in self.store.list_tag_definition_payloads()}
+        if not category_ids <= known_categories:
+            raise ValueError("Source classification contains an unknown category")
+        if not tag_ids <= known_tags:
+            raise ValueError("Source classification contains an unknown tag")
+        if not category_ids and not tag_ids and not roles:
+            raise ValueError("Source classification cannot be empty")
+        source.category_ids = set(category_ids)
+        source.tag_ids = set(tag_ids)
+        source.roles = set(roles)
+        source.policy_revision += 1
+        self.store.save_source(source)
+        self.store.mark_proposals_stale(
+            {"folder", "move", "rename", "finding"},
+            "Source classification changed",
+        )
+        self.store.activity(
+            "source.classified",
+            f"Approved categories, tags, and routing roles for {source.name}",
+        )
+        self.workspace_changed.emit()
+        self.activity_changed.emit()
 
     def assign_folder_policy(
         self,
@@ -240,16 +293,14 @@ class WorkspaceController(QObject):
                     for value in existing_categories
                     if str(value.get("semantic_key", "")) == category_template.semantic_key
                     or (
-                        str(value.get("name", "")).casefold()
-                        == category_template.name.casefold()
+                        str(value.get("name", "")).casefold() == category_template.name.casefold()
                         and value.get("parent_id") == parent_id
                     )
                 ),
                 None,
             )
             mapped_tags = {
-                tag_id_map.get(tag_id, tag_id)
-                for tag_id in category_template.default_tag_ids
+                tag_id_map.get(tag_id, tag_id) for tag_id in category_template.default_tag_ids
             }
             if existing:
                 category_id_map[category_template.id] = str(existing["id"])
@@ -262,10 +313,7 @@ class WorkspaceController(QObject):
                 if new_tags != upgraded.default_tag_ids:
                     upgraded.default_tag_ids = new_tags
                     changed = True
-                if (
-                    category_template.suggest_as_folder
-                    and not upgraded.suggest_as_folder
-                ):
+                if category_template.suggest_as_folder and not upgraded.suggest_as_folder:
                     upgraded.suggest_as_folder = True
                     changed = True
                 if changed:
@@ -333,9 +381,6 @@ class WorkspaceController(QObject):
 
     def folder_depth_limit(self, root_id: str, category_id: str = "") -> int:
         limit = self.folder_depth_policy().maximum_depth
-        source = self.sources.get(root_id)
-        if source and source.max_hierarchy_depth is not None:
-            limit = min(limit, max(1, int(source.max_hierarchy_depth)))
         if self.store and category_id:
             category = next(
                 (
@@ -353,8 +398,7 @@ class WorkspaceController(QObject):
         policy = self.folder_depth_policy()
         categories = self.store.list_category_payloads() if self.store else []
         category_tags = {
-            str(value["id"]): set(value.get("default_tag_ids", []))
-            for value in categories
+            str(value["id"]): set(value.get("default_tag_ids", [])) for value in categories
         }
         roots: dict[str, Any] = {}
         for root_id in sorted(root_ids):
@@ -413,9 +457,7 @@ class WorkspaceController(QObject):
         return [
             {
                 **value,
-                "tag_ids": sorted(
-                    tags_by_item.get(self.inventory_tag_key(value), set())
-                ),
+                "tag_ids": sorted(tags_by_item.get(self.inventory_tag_key(value), set())),
             }
             for value in self.items
         ]
@@ -450,9 +492,7 @@ class WorkspaceController(QObject):
         if not self.store:
             raise RuntimeError("Open a workspace first")
         known_items = {str(value["id"]) for value in self.items}
-        known_tags = {
-            str(value["id"]) for value in self.store.list_tag_definition_payloads()
-        }
+        known_tags = {str(value["id"]) for value in self.store.list_tag_definition_payloads()}
         if not item_ids <= known_items or not tag_ids <= known_tags:
             raise ValueError("Unknown inventory item or tag")
         count = 0
@@ -464,9 +504,7 @@ class WorkspaceController(QObject):
                     TagAssignment("inventory", entity_key, tag_id, source="user")
                 )
                 count += 1
-        self.store.mark_proposals_stale(
-            {"move", "finding"}, "Approved inventory tags changed"
-        )
+        self.store.mark_proposals_stale({"move", "finding"}, "Approved inventory tags changed")
         self.store.activity(
             "tag.assignment",
             f"Assigned {len(tag_ids)} tag(s) to {len(item_ids)} inventory item(s)",
@@ -485,9 +523,7 @@ class WorkspaceController(QObject):
         }
         count = self.store.delete_tag_assignments("inventory", entity_keys, tag_ids)
         if count:
-            self.store.mark_proposals_stale(
-                {"move", "finding"}, "Approved inventory tags changed"
-            )
+            self.store.mark_proposals_stale({"move", "finding"}, "Approved inventory tags changed")
             self.store.activity(
                 "tag.assignment_removed",
                 f"Removed {count} inventory tag assignment(s)",
@@ -508,14 +544,16 @@ class WorkspaceController(QObject):
             fingerprint_mode = self.metadata_fingerprint_mode()
             for item in run.items:
                 metadata = self.store.cached_metadata(item)
+                if metadata is not None and not metadata_cache_compatible(item, metadata):
+                    metadata = None
                 path = source.path / item.relative_path
                 if metadata is not None and fingerprint_mode in {"crc32", "sha256"}:
                     stored_fingerprint = metadata.get("content_fingerprint", {})
-                    if (
-                        stored_fingerprint.get("algorithm") != fingerprint_mode
-                        or content_fingerprint(path, fingerprint_mode)["value"]
-                        != stored_fingerprint.get("value")
-                    ):
+                    if stored_fingerprint.get(
+                        "algorithm"
+                    ) != fingerprint_mode or content_fingerprint(path, fingerprint_mode)[
+                        "value"
+                    ] != stored_fingerprint.get("value"):
                         metadata = None
                 if metadata is None:
                     metadata = self.metadata_indexer.extract(path, item)
@@ -526,9 +564,7 @@ class WorkspaceController(QObject):
                     updates.append((item, metadata))
                 else:
                     metadata_by_key[(item.root_id, item.relative_path)] = metadata
-            metadata_by_key.update(
-                self.store.save_cached_metadata_batch(updates)
-            )
+            metadata_by_key.update(self.store.save_cached_metadata_batch(updates))
             enriched = [
                 replace(
                     item,
@@ -565,9 +601,7 @@ class WorkspaceController(QObject):
         if not self.store:
             raise RuntimeError("Open a workspace first")
         items_by_key = {
-            (item.root_id, item.relative_path): item
-            for run in result.runs
-            for item in run.items
+            (item.root_id, item.relative_path): item for run in result.runs for item in run.items
         }
         saved_metadata = self.store.save_cached_metadata_batch(
             [
@@ -585,9 +619,7 @@ class WorkspaceController(QObject):
             self.store.save_source(source)
             enriched = []
             for item in run.items:
-                metadata = saved_metadata.get(
-                    (item.root_id, item.relative_path), item.metadata
-                )
+                metadata = saved_metadata.get((item.root_id, item.relative_path), item.metadata)
                 enriched_item = replace(item, metadata=metadata)
                 enriched.append(enriched_item)
             self.store.mark_semantic_stale_batch(
@@ -680,9 +712,8 @@ class WorkspaceController(QObject):
             if source is None:
                 continue
             path = (source.path / str(item.get("relative_path", ""))).resolve(strict=False)
-            root_is_downloads = (
-                FolderRole.DOWNLOADS in source.roles
-                or bool(source.category_ids & download_category_ids)
+            root_is_downloads = FolderRole.DOWNLOADS in source.roles or bool(
+                source.category_ids & download_category_ids
             )
             assigned_downloads = any(
                 path == assignment or assignment in path.parents for assignment in assignments
@@ -698,8 +729,7 @@ class WorkspaceController(QObject):
             raise RuntimeError("Open a workspace first")
         items = self.download_items()
         paths = [
-            self.sources[str(item["root_id"])].path / str(item["relative_path"])
-            for item in items
+            self.sources[str(item["root_id"])].path / str(item["relative_path"]) for item in items
         ]
         result = self.defender_scanner.history_for_paths(paths, progress)
         if not result.available:
@@ -813,8 +843,7 @@ class WorkspaceController(QObject):
                 (
                     value
                     for value in self.download_items()
-                    if f"{value['root_id']}:{value['relative_path']}"
-                    == assessment.entity_key
+                    if f"{value['root_id']}:{value['relative_path']}" == assessment.entity_key
                 ),
                 None,
             )
@@ -893,9 +922,7 @@ class WorkspaceController(QObject):
         )
         self.activity_changed.emit()
 
-    def record_update_hint_failure(
-        self, entity_kind: str, entity_key: str, message: str
-    ) -> None:
+    def record_update_hint_failure(self, entity_kind: str, entity_key: str, message: str) -> None:
         if not self.store:
             raise RuntimeError("Open a workspace first")
         self.store.save_semantic_record(
@@ -909,9 +936,7 @@ class WorkspaceController(QObject):
                 status="error",
             )
         )
-        self.store.activity(
-            "updates.hint_failed", f"Saved update hint failure for {entity_key}"
-        )
+        self.store.activity("updates.hint_failed", f"Saved update hint failure for {entity_key}")
         self.activity_changed.emit()
 
     def save_prompt_revision(self, revision: PromptRevision) -> None:
@@ -921,6 +946,7 @@ class WorkspaceController(QObject):
         view = revision.profile_id.removeprefix("view:")
         affected = {
             "rename": {"rename"},
+            "repair": {"finding"},
             "folder": {"folder", "move"},
             "move": {"move"},
             "action": {"finding", "move"},
@@ -972,7 +998,14 @@ class WorkspaceController(QObject):
     def set_ai_context(self, view_key: str, provider: str, model: str) -> None:
         if not self.store:
             return
-        if provider not in {"local", "deepseek", "openai", "anthropic", "codex"}:
+        if provider not in {
+            "local",
+            "deepseek",
+            "openrouter",
+            "openai",
+            "anthropic",
+            "codex",
+        }:
             raise ValueError("Unknown AI provider")
         self.store.set_meta(
             f"ai_context:{view_key}",
@@ -1046,13 +1079,30 @@ class WorkspaceController(QObject):
                     str(row["id"]),
                     str(row["created_at"]),
                 )
-        return PromptCompiler().compile(
+        return PromptCompiler(self.private_redaction_terms()).compile(
             provider=provider,
             model=model,
             workspace=workspace_revision,
             view=view_revision,
             categories=category_revisions,
             evidence=evidence,
+        )
+
+    @staticmethod
+    def private_redaction_terms() -> tuple[str, ...]:
+        raw = SecretStore().get("private_redaction_terms")
+        if not raw:
+            return ()
+        try:
+            values = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return ()
+        if not isinstance(values, list):
+            return ()
+        return tuple(
+            value.strip()
+            for value in values[:250]
+            if isinstance(value, str) and 2 <= len(value.strip()) <= 500
         )
 
     def save_action_result(self, run: ActionRun, findings: FindingSet) -> str | None:
@@ -1215,7 +1265,7 @@ class WorkspaceController(QObject):
             if row.get("is_placeholder"):
                 raise RuntimeError("Hydrate selected cloud-only files before rename")
             proposed_name = str(row["proposed"]).strip()
-            if not proposed_name or Path(proposed_name).name != proposed_name:
+            if not valid_filename_proposal(str(row.get("current", "")), proposed_name):
                 raise ValueError(f"Proposed filename is invalid: {proposed_name!r}")
             source_root = self.sources[str(row["root_id"])].path
             source = source_root / str(row["relative_path"])
@@ -1342,15 +1392,19 @@ class WorkspaceController(QObject):
                 blocked.append(f"Unknown source scope {root_id}")
                 continue
             effective = source.cloud_policy
-            for category_id in source.category_ids:
-                category = categories.get(category_id)
-                if not category:
-                    continue
-                category_policy = CloudPolicy(category.get("cloud_policy", "inherit"))
-                if category_policy != CloudPolicy.INHERIT and _cloud_policy_rank(
-                    category_policy
-                ) < _cloud_policy_rank(effective):
-                    effective = category_policy
+            # A source policy is the user's explicit authorization for that physical root.
+            # Category policies supply a default only when a source explicitly inherits;
+            # silently lowering a later source choice made text_and_images appear metadata-only.
+            if effective == CloudPolicy.INHERIT:
+                inherited = [
+                    CloudPolicy(category["cloud_policy"])
+                    for category_id in source.category_ids
+                    if (category := categories.get(category_id))
+                    and CloudPolicy(category.get("cloud_policy", "inherit")) != CloudPolicy.INHERIT
+                ]
+                effective = (
+                    min(inherited, key=_cloud_policy_rank) if inherited else CloudPolicy.NONE
+                )
             policies[root_id] = effective.value
             if _cloud_policy_rank(effective) < required:
                 blocked.append(
@@ -1410,9 +1464,7 @@ class WorkspaceController(QObject):
                 root_id,
                 current_paths,
                 changes,
-                case_sensitive=bool(
-                    source.capabilities and source.capabilities.case_sensitive
-                ),
+                case_sensitive=bool(source.capabilities and source.capabilities.case_sensitive),
                 windows_rules=platform.system() == "Windows",
             )
             if not projection.ready:
@@ -1455,9 +1507,7 @@ class WorkspaceController(QObject):
                     }
                 )
             else:
-                for project_path in _protected_project_paths(
-                    self.items, str(row["root_id"])
-                ):
+                for project_path in _protected_project_paths(self.items, str(row["root_id"])):
                     candidate = Path(projected)
                     project = Path(project_path)
                     if project_path == "" or candidate == project or project in candidate.parents:
@@ -1534,9 +1584,7 @@ class WorkspaceController(QObject):
         case_sensitive: dict[str, bool] = {}
         for root_id, source in self.sources.items():
             existing_paths[root_id] = {
-                str(item["relative_path"])
-                for item in self.items
-                if item["root_id"] == root_id
+                str(item["relative_path"]) for item in self.items if item["root_id"] == root_id
             }
             projected_folders[root_id] = {
                 str(item["relative_path"])
@@ -1555,11 +1603,7 @@ class WorkspaceController(QObject):
             protected_paths,
             case_sensitive,
         )
-        issues = [
-            issue
-            for projection in projections.values()
-            for issue in projection.issues
-        ]
+        issues = [issue for projection in projections.values() for issue in projection.issues]
         if issues:
             raise ValueError("Projected moves are invalid: " + "; ".join(issues))
         requests: list[MoveRequest] = []
@@ -1643,9 +1687,7 @@ class WorkspaceController(QObject):
                         if operation.get(key):
                             active_paths.add(Path(str(operation[key])))
         rows: list[dict[str, Any]] = []
-        move_empty_paths = (
-            self.store.completed_move_source_folders() if self.store else set()
-        )
+        move_empty_paths = self.store.completed_move_source_folders() if self.store else set()
         for root_id, source in self.sources.items():
             if not source.capabilities or not source.capabilities.reachable:
                 continue
@@ -1697,9 +1739,7 @@ class WorkspaceController(QObject):
                 self.items,
                 move_created_empty_paths=move_empty_paths,
             ):
-                current_keys.add(
-                    (candidate.root_id, candidate.relative_path, candidate.kind.value)
-                )
+                current_keys.add((candidate.root_id, candidate.relative_path, candidate.kind.value))
         missing = selected_keys - current_keys
         if missing:
             raise RuntimeError(
@@ -1802,8 +1842,7 @@ class WorkspaceController(QObject):
             item
             for item in self.items
             if not item.get("is_dir")
-            and str(item.get("extension", "")).casefold()
-            in {".pdf", ".docx", ".xlsx", ".txt"}
+            and str(item.get("extension", "")).casefold() in {".pdf", ".docx", ".xlsx", ".txt"}
         ]
         evidence_by_item: dict[str, list[dict[str, Any]]] = {}
         item_ids = [str(item["id"]) for item in eligible]
@@ -2052,16 +2091,12 @@ def _category_from_payload(payload: dict[str, Any]) -> CategoryDefinition:
         sensitivity=Sensitivity(payload.get("sensitivity", "normal")),
         cloud_policy=CloudPolicy(payload.get("cloud_policy", "inherit")),
         default_naming_profile=payload.get("default_naming_profile"),
-        allowed_destination_category_ids=set(
-            payload.get("allowed_destination_category_ids", [])
-        ),
+        allowed_destination_category_ids=set(payload.get("allowed_destination_category_ids", [])),
         allowed_roles={
-            FolderRole(value)
-            for value in payload.get("allowed_roles", ["destination", "archive"])
+            FolderRole(value) for value in payload.get("allowed_roles", ["destination", "archive"])
         },
         preferred_destinations={
-            str(key): int(value)
-            for key, value in payload.get("preferred_destinations", {}).items()
+            str(key): int(value) for key, value in payload.get("preferred_destinations", {}).items()
         },
         max_hierarchy_depth=int(payload.get("max_hierarchy_depth", 3)),
         permitted_kinds=set(payload.get("permitted_kinds", [])),

@@ -143,9 +143,7 @@ class TagDefinition:
     description: str = ""
     aliases: list[str] = field(default_factory=list)
     guidance: str = ""
-    applies_to: set[str] = field(
-        default_factory=lambda: {"file", "folder", "software", "email"}
-    )
+    applies_to: set[str] = field(default_factory=lambda: {"file", "folder", "software", "email"})
     mutually_exclusive_within_facet: bool = False
     revision: int = 1
 

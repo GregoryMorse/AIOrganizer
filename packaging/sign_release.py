@@ -9,7 +9,9 @@ from collections.abc import Mapping
 from pathlib import Path
 
 
-def signing_command(platform_name: str, artifact: Path, environment: Mapping[str, str]) -> list[str]:
+def signing_command(
+    platform_name: str, artifact: Path, environment: Mapping[str, str]
+) -> list[str]:
     if platform_name == "windows":
         thumbprint = environment.get("AIORGANIZER_WINDOWS_CERT_SHA1", "").strip()
         if not thumbprint:

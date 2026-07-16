@@ -118,7 +118,10 @@ class CleanupAnalyzer:
                 root_id, root, project_path, inventory_markers, max_candidates - len(candidates)
             ):
                 key = candidate.relative_path.casefold()
-                if key not in seen and (root / candidate.relative_path).resolve(strict=False) not in active:
+                if (
+                    key not in seen
+                    and (root / candidate.relative_path).resolve(strict=False) not in active
+                ):
                     candidates.append(candidate)
                     seen.add(key)
         return sorted(candidates, key=lambda value: value.relative_path.casefold())
@@ -138,14 +141,15 @@ class CleanupAnalyzer:
         candidates: list[CleanupCandidate] = []
         for directory, child_dirs, filenames in os.walk(project_root, followlinks=False):
             current = Path(directory)
-            if current != project_root and any(name.casefold() in {".git", ".hg", ".svn"} for name in child_dirs):
+            if current != project_root and any(
+                name.casefold() in {".git", ".hg", ".svn"} for name in child_dirs
+            ):
                 child_dirs.clear()
                 continue
             child_dirs[:] = [
                 name
                 for name in child_dirs
-                if name.casefold() not in _QUARANTINE_NAMES
-                and not (current / name).is_symlink()
+                if name.casefold() not in _QUARANTINE_NAMES and not (current / name).is_symlink()
             ]
             for name in list(child_dirs):
                 path = current / name
@@ -173,7 +177,10 @@ class CleanupAnalyzer:
                             path,
                             size,
                             count,
-                            ("TeX source exists in this project", f"generated suffix {_compound_suffix(path.name)}"),
+                            (
+                                "TeX source exists in this project",
+                                f"generated suffix {_compound_suffix(path.name)}",
+                            ),
                         )
                     )
                     if len(candidates) >= remaining:
@@ -208,24 +215,38 @@ def _artifact_candidate(
 
 def _artifact_evidence(name: str, markers: set[str], path: Path) -> tuple[str, ...]:
     folded = name.casefold()
-    if folded in {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"} and markers & _PYTHON_MARKERS:
-        return (f"Python manifest: {sorted(markers & _PYTHON_MARKERS)[0]}", f"known Python cache: {name}")
+    if (
+        folded in {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+        and markers & _PYTHON_MARKERS
+    ):
+        return (
+            f"Python manifest: {sorted(markers & _PYTHON_MARKERS)[0]}",
+            f"known Python cache: {name}",
+        )
     if folded == "node_modules" and markers & _NODE_MARKERS:
         return (f"Node manifest: {sorted(markers & _NODE_MARKERS)[0]}", "dependency install output")
     if folded == "target" and markers & _RUST_MARKERS:
         return (f"Rust manifest: {sorted(markers & _RUST_MARKERS)[0]}", "Cargo target output")
     if folded in {"target", "build"} and markers & _JAVA_MARKERS:
-        return (f"Java build manifest: {sorted(markers & _JAVA_MARKERS)[0]}", f"generated {name} output")
-    if folded == "build" and markers & _CMAKE_MARKERS and ((path / "CMakeCache.txt").exists() or (path / "CMakeFiles").is_dir()):
+        return (
+            f"Java build manifest: {sorted(markers & _JAVA_MARKERS)[0]}",
+            f"generated {name} output",
+        )
+    if (
+        folded == "build"
+        and markers & _CMAKE_MARKERS
+        and ((path / "CMakeCache.txt").exists() or (path / "CMakeFiles").is_dir())
+    ):
         return ("CMakeLists.txt", "CMakeCache.txt/CMakeFiles generation marker")
     return ()
 
 
-def _project_paths(
-    root: Path, items: list[dict[str, object]]
-) -> list[tuple[Path, set[str]]]:
+def _project_paths(root: Path, items: list[dict[str, object]]) -> list[tuple[Path, set[str]]]:
     projects: list[tuple[Path, set[str]]] = []
-    if any(bool(row.get("inside_protected_project")) and not row.get("protected_project_path") for row in items):
+    if any(
+        bool(row.get("inside_protected_project")) and not row.get("protected_project_path")
+        for row in items
+    ):
         projects.append((root, _directory_names(root)))
     for row in items:
         if not bool(row.get("is_project_root")):

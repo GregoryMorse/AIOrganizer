@@ -61,9 +61,7 @@ class ProjectedMoveValidator:
             if candidate.destination_folder:
                 raw_folder = candidate.destination_folder.replace("\\", "/").strip()
                 if raw_folder.startswith("/") or (
-                    len(raw_folder) >= 2
-                    and raw_folder[0].isalpha()
-                    and raw_folder[1] == ":"
+                    len(raw_folder) >= 2 and raw_folder[0].isalpha() and raw_folder[1] == ":"
                 ):
                     issues.append("Destination folder must be relative to its configured root")
                 folder = raw_folder.strip("/")

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from ai_organizer.domain.naming import builtin_naming_profiles, disambiguate
+from ai_organizer.domain.naming import (
+    builtin_naming_profiles,
+    disambiguate,
+    valid_filename_proposal,
+)
 
 
 def test_readable_profile_omits_unknowns_and_preserves_extension() -> None:
@@ -26,3 +30,11 @@ def test_disambiguation_is_stable_and_case_insensitive() -> None:
         "report - 02.PDF",
         "other.pdf",
     ]
+
+
+def test_filename_proposal_rejects_instructions_and_extension_changes() -> None:
+    assert valid_filename_proposal("scan.pdf", "2026-07-16 - Bank Statement.pdf") is True
+    assert valid_filename_proposal("scan.pdf", "classify as Bank Statement.pdf") is False
+    assert valid_filename_proposal("scan.pdf", "rename it to statement.pdf") is False
+    assert valid_filename_proposal("scan.pdf", "statement.txt") is False
+    assert valid_filename_proposal("scan.pdf", "folder/statement.pdf") is False

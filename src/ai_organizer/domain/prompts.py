@@ -13,7 +13,14 @@ from .models import new_id, utc_now
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)(api[_ -]?key|access[_ -]?token|password|secret|mfa|reset[_ -]?code)\s*[:=]\s*([^\s,;]+)"
 )
-_LONG_IDENTIFIER = re.compile(r"\b\d{12,19}\b")
+_PRIVATE_KEY = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S
+)
+_IBAN = re.compile(r"(?i)(?<![A-Z0-9])[A-Z]{2}\d{2}(?:[ -]?[A-Z0-9]){11,30}(?![A-Z0-9])")
+_LONG_IDENTIFIER = re.compile(r"(?<!\d)(?:\d[ -]?){8,18}\d(?!\d)")
+_SECURITY_CODE = re.compile(
+    r"(?i)\b(otp|mfa|verification|reset)\s*(?:code)?\s*[:=#-]?\s*(\d{4,8})\b"
+)
 
 
 class PromptLayerKind(StrEnum):
@@ -85,6 +92,29 @@ class PromptCompiler:
         "Do not invent dates, entities, categories, or destinations. Explain uncertainty."
     )
 
+    def __init__(self, private_terms: Sequence[str] = ()) -> None:
+        terms = sorted(
+            {value.strip() for value in private_terms if 2 <= len(value.strip()) <= 500},
+            key=len,
+            reverse=True,
+        )[:250]
+        self._private_pattern = (
+            re.compile(
+                r"(?<!\w)(?:" + "|".join(re.escape(value) for value in terms) + r")(?!\w)",
+                re.IGNORECASE,
+            )
+            if terms
+            else None
+        )
+
+    def redact(self, text: str) -> str:
+        value = (
+            self._private_pattern.sub("[USER PRIVATE VALUE REDACTED]", text)
+            if self._private_pattern
+            else text
+        )
+        return redact_sensitive(value)
+
     def validate_editable(self, text: str) -> None:
         if len(text) > self.MAX_EDITABLE_CHARS:
             raise ValueError(f"Guidance is limited to {self.MAX_EDITABLE_CHARS} characters")
@@ -121,7 +151,7 @@ class PromptCompiler:
                 layers.append(
                     PromptLayer(
                         revision.kind,
-                        redact_sensitive(revision.text.strip()),
+                        self.redact(revision.text.strip()),
                         revision.id,
                         True,
                         label,
@@ -133,7 +163,7 @@ class PromptCompiler:
                 layers.append(
                     PromptLayer(
                         PromptLayerKind.CATEGORY,
-                        redact_sensitive(revision.text.strip()),
+                        self.redact(revision.text.strip()),
                         revision.id,
                         True,
                         "Category",
@@ -144,7 +174,7 @@ class PromptCompiler:
             layers.append(
                 PromptLayer(
                     PromptLayerKind.ACTION,
-                    redact_sensitive(action.text.strip()),
+                    self.redact(action.text.strip()),
                     action.id,
                     True,
                     "Action",
@@ -155,13 +185,13 @@ class PromptCompiler:
             layers.append(
                 PromptLayer(
                     PromptLayerKind.RUN,
-                    redact_sensitive(run_note.strip()),
+                    self.redact(run_note.strip()),
                     "ephemeral-run",
                     True,
                     "Run",
                 )
             )
-        evidence_text = redact_sensitive(evidence[:4_000_000])
+        evidence_text = self.redact(evidence[:4_000_000])
         layers.append(
             PromptLayer(
                 PromptLayerKind.EVIDENCE,
@@ -186,5 +216,30 @@ class PromptCompiler:
 
 
 def redact_sensitive(text: str) -> str:
-    value = _SECRET_ASSIGNMENT.sub(lambda match: f"{match.group(1)}=[REDACTED]", text)
-    return _LONG_IDENTIFIER.sub(lambda match: f"[MASKED…{match.group(0)[-4:]}]", value)
+    value = _PRIVATE_KEY.sub("[PRIVATE KEY REDACTED]", text)
+    value = _SECRET_ASSIGNMENT.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
+    value = _SECURITY_CODE.sub(lambda match: f"{match.group(1)} code=[REDACTED]", value)
+    value = _IBAN.sub(_mask_iban, value)
+    return _LONG_IDENTIFIER.sub(_mask_long_identifier, value)
+
+
+def sensitive_fragments(text: str) -> list[str]:
+    """Return exact sensitive substrings so a reversible local redactor can protect them."""
+    values = [match.group(0) for match in _PRIVATE_KEY.finditer(text)]
+    values.extend(match.group(2) for match in _SECRET_ASSIGNMENT.finditer(text))
+    values.extend(match.group(2) for match in _SECURITY_CODE.finditer(text))
+    values.extend(match.group(0) for match in _IBAN.finditer(text))
+    values.extend(match.group(0) for match in _LONG_IDENTIFIER.finditer(text))
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _mask_iban(match: re.Match[str]) -> str:
+    compact = re.sub(r"[ -]", "", match.group(0))
+    return f"[IBAN MASKED…{compact[-4:]}]"
+
+
+def _mask_long_identifier(match: re.Match[str]) -> str:
+    digits = re.sub(r"\D", "", match.group(0))
+    if not 9 <= len(digits) <= 19:
+        return match.group(0)
+    return f"[MASKED…{digits[-4:]}]"

@@ -24,9 +24,7 @@ def test_bulk_table_is_multiselect_resizable_and_typed_sortable(qtbot) -> None: 
     assert table.isSortingEnabled()
     assert table.horizontalHeader().sectionResizeMode(0) == QHeaderView.ResizeMode.Interactive
 
-    ten_row = next(
-        index for index, row in enumerate(model.rows) if row["detections"] == 10
-    )
+    ten_row = next(index for index, row in enumerate(model.rows) if row["detections"] == 10)
     table.selectRow(ten_row)
     model.sort(1, Qt.SortOrder.AscendingOrder)
     assert [row["detections"] for row in model.rows] == [2, 10]

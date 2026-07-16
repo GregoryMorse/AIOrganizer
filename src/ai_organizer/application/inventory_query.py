@@ -5,6 +5,8 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
+from ai_organizer.adapters.storage_inventory import StorageInventory
+
 
 class InventoryQueryService:
     """Bounded read-only discovery over persisted inventory records."""
@@ -15,15 +17,46 @@ class InventoryQueryService:
         sources: Sequence[Mapping[str, Any]] = (),
         cache_stats: Mapping[str, Any] | None = None,
         organization_context: Mapping[str, Any] | None = None,
+        storage_inventory: StorageInventory | None = None,
     ) -> None:
         self.items = list(items)
         self.sources = list(sources)
         self.cache_stats = dict(cache_stats or {})
         self.organization_context = dict(organization_context or {})
+        self.storage_inventory = storage_inventory or StorageInventory()
 
     def organization_taxonomy(self) -> dict[str, Any]:
         """Return approved vocabulary and hierarchy constraints, never inferred content."""
         return dict(self.organization_context)
+
+    def storage_volumes(self) -> dict[str, Any]:
+        """Return mounted volume capacity and configured-source coverage."""
+        volumes = self.storage_inventory.list_volumes([dict(value) for value in self.sources])
+        return {
+            "volumes": volumes,
+            "total": len(volumes),
+            "uncovered_volume_count": sum(
+                1 for value in volumes if not value.get("has_configured_source")
+            ),
+        }
+
+    def storage_list_directory(
+        self,
+        volume_id: str,
+        relative_path: str = "",
+        *,
+        include_hidden: bool = False,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """List names and stat metadata only; never read file content."""
+        return self.storage_inventory.list_directory(
+            volume_id,
+            relative_path,
+            include_hidden=include_hidden,
+            offset=offset,
+            limit=limit,
+        )
 
     def list_roots(self) -> list[dict[str, Any]]:
         counts = Counter(str(item.get("root_id", "")) for item in self.items)
@@ -34,7 +67,6 @@ class InventoryQueryService:
                 "roles": list(source.get("roles", [])),
                 "category_ids": list(source.get("category_ids", [])),
                 "tag_ids": list(source.get("tag_ids", [])),
-                "max_hierarchy_depth": source.get("max_hierarchy_depth"),
                 "item_count": counts[str(source.get("id", ""))],
             }
             for source in self.sources
@@ -158,9 +190,18 @@ class InventoryQueryService:
         )
         mime_types = Counter(str(item.get("mime_type", "unknown")) for item in files)
         top_level = Counter(
-            (str(item.get("relative_path", "")).replace("\\", "/").split("/", 1)[0]
-             or "[root]")
+            (str(item.get("relative_path", "")).replace("\\", "/").split("/", 1)[0] or "[root]")
             for item in files
+        )
+        health_status = Counter(
+            str(item.get("metadata", {}).get("file_health_status", "not_inspected"))
+            for item in files
+        )
+        health_codes = Counter(
+            str(issue.get("code", "unknown"))
+            for item in files
+            for issue in item.get("metadata", {}).get("file_health_issues", [])
+            if isinstance(issue, Mapping)
         )
         return {
             "glob": glob,
@@ -171,6 +212,8 @@ class InventoryQueryService:
             "by_extension": dict(extensions.most_common()),
             "by_mime_type": dict(mime_types.most_common()),
             "by_top_level_folder": dict(top_level.most_common(100)),
+            "by_file_health_status": dict(health_status.most_common()),
+            "by_file_health_issue_code": dict(health_codes.most_common(100)),
             "oldest_modified_ns": min(
                 (int(item.get("modified_ns", 0)) for item in scoped), default=None
             ),
@@ -180,17 +223,61 @@ class InventoryQueryService:
             "metadata_cache": self.cache_stats,
         }
 
+    def list_file_issues(
+        self,
+        *,
+        root_ids: set[str] | None = None,
+        severity: str | None = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Return parser-reported issues without treating warnings as corruption claims."""
+        values = []
+        for item in self.items:
+            if item.get("is_dir") or (root_ids and str(item.get("root_id", "")) not in root_ids):
+                continue
+            issues = [
+                dict(value)
+                for value in item.get("metadata", {}).get("file_health_issues", [])
+                if isinstance(value, Mapping)
+                and (not severity or str(value.get("severity")) == severity)
+            ]
+            if not issues:
+                continue
+            values.append(
+                {
+                    "item_id": str(item.get("id", "")),
+                    "root_id": str(item.get("root_id", "")),
+                    "relative_path": str(item.get("relative_path", "")),
+                    "status": str(item.get("metadata", {}).get("file_health_status", "warning")),
+                    "issues": issues[:50],
+                }
+            )
+        start = max(0, offset)
+        bounded = max(1, min(250, limit))
+        return {
+            "items": values[start : start + bounded],
+            "total": len(values),
+            "offset": start,
+            "limit": bounded,
+            "has_more": start + bounded < len(values),
+            "interpretation": (
+                "Warnings mean a parser recovered from a nonstandard or inconsistent structure; "
+                "they are not automatic proof of corruption."
+            ),
+        }
+
     def folder_tree(
         self,
         *,
         root_ids: set[str] | None = None,
-        max_depth: int = 6,
+        max_depth: int | None = None,
         offset: int = 0,
         limit: int = 250,
     ) -> dict[str, Any]:
         """Return a bounded flat hierarchy that is cheap for models to reason over."""
-        depth_limit = max(1, min(12, max_depth))
-        folders = []
+        depth_limit = max(1, min(12, max_depth)) if max_depth else None
+        folders: list[dict[str, Any]] = []
         for item in self.items:
             if not item.get("is_dir"):
                 continue
@@ -199,7 +286,7 @@ class InventoryQueryService:
                 continue
             path = str(item.get("relative_path", "")).replace("\\", "/").strip("/")
             depth = len([part for part in path.split("/") if part])
-            if depth > depth_limit:
+            if depth_limit is not None and depth > depth_limit:
                 continue
             folders.append(
                 {

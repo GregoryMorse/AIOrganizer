@@ -53,12 +53,15 @@ class UpdatePageHint(BaseModel):
     ]
     version_locator: Annotated[str, Field(min_length=1, max_length=1_000)]
     version_prefix: Annotated[str, Field(max_length=200)] = ""
-    version_format: Literal[
-        "dotted_numeric",
-        "dotted_numeric_with_suffix",
-        "integer",
-        "date_yyyymmdd",
-    ] | None = None
+    version_format: (
+        Literal[
+            "dotted_numeric",
+            "dotted_numeric_with_suffix",
+            "integer",
+            "date_yyyymmdd",
+        ]
+        | None
+    ) = None
     version_regex: Annotated[str, Field(max_length=300)] = ""
     version_capture_group: Annotated[int, Field(ge=0, le=10)] = 1
     version_normalization: Literal["trim", "strip_v_prefix"] = "strip_v_prefix"
@@ -73,9 +76,7 @@ class UpdatePageHint(BaseModel):
     @classmethod
     def prefer_declarative_version_locator(cls, value: object) -> object:
         """Never validate or retain model-authored regex when a safe locator is present."""
-        if isinstance(value, dict) and value.get("version_prefix") and value.get(
-            "version_format"
-        ):
+        if isinstance(value, dict) and value.get("version_prefix") and value.get("version_format"):
             value = dict(value)
             value["version_regex"] = ""
             value["version_capture_group"] = 1
@@ -103,9 +104,7 @@ class UpdatePageHint(BaseModel):
         if self.version_format is not None:
             if not self.version_prefix.strip():
                 raise ValueError("Declarative version locator requires a literal prefix")
-            self.version_regex = compile_version_regex(
-                self.version_prefix, self.version_format
-            )
+            self.version_regex = compile_version_regex(self.version_prefix, self.version_format)
             self.version_capture_group = 1
         return self
 

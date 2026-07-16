@@ -31,5 +31,5 @@ class OpenRouterProvider(OpenAIChatToolProvider):
         )
 
     def _tool_request_extras(self) -> dict[str, Any]:
-        # OpenRouter normalizes tool calls across its selected upstream provider.
-        return {}
+        # Refuse routing unless the selected upstream endpoint has a declared ZDR policy.
+        return {"extra_body": {"provider": {"zdr": True}}}

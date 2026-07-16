@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import sys
 
-from .environment import load_development_env
-from .mcp_registration import ensure_codex_mcp_registration
+from ai_organizer.bootstrap.environment import load_development_env
+from ai_organizer.bootstrap.mcp_registration import ensure_codex_mcp_registration
 
 
 def main() -> int:

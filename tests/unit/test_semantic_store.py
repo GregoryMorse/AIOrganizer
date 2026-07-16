@@ -52,12 +52,20 @@ def test_version_change_stales_assessment_but_preserves_update_hint(tmp_path: Pa
     second = SoftwarePackage(package_id, "Example App", "Example Corp", "2.0", "test")
     store.save_semantic_record(
         SemanticRecord(
-            "software", package_id, "update_assessment", {"latest_version": "2.0"}, first.version_fingerprint
+            "software",
+            package_id,
+            "update_assessment",
+            {"latest_version": "2.0"},
+            first.version_fingerprint,
         )
     )
     store.save_semantic_record(
         SemanticRecord(
-            "software", package_id, "update_hint", {"official_page_url": "https://example.test"}, first.identity_fingerprint
+            "software",
+            package_id,
+            "update_hint",
+            {"official_page_url": "https://example.test"},
+            first.identity_fingerprint,
         )
     )
 
@@ -66,6 +74,8 @@ def test_version_change_stales_assessment_but_preserves_update_hint(tmp_path: Pa
     )
 
     assert changed == 1
-    assert store.get_semantic_record("software", package_id, "update_assessment")["status"] == "stale"
+    assert (
+        store.get_semantic_record("software", package_id, "update_assessment")["status"] == "stale"
+    )
     assert store.get_semantic_record("software", package_id, "update_hint")["status"] == "current"
     store.close()

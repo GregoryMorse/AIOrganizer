@@ -141,7 +141,11 @@ class FileSystemInventory:
                         is_placeholder=placeholder,
                         is_project_root=bool(project_markers),
                         inside_protected_project=root_is_project,
-                        protected_project_path="" if root_is_project else relative if project_markers else "",
+                        protected_project_path=""
+                        if root_is_project
+                        else relative
+                        if project_markers
+                        else "",
                         project_markers=project_markers,
                         has_build_outputs=is_dir
                         and any(
@@ -161,9 +165,7 @@ class FileSystemInventory:
                         discovered_bytes += max(0, item.size)
                     if progress:
                         progress(
-                            DiscoveryProgress(
-                                len(results), file_count, discovered_bytes, relative
-                            )
+                            DiscoveryProgress(len(results), file_count, discovered_bytes, relative)
                         )
                     if is_dir and not item.is_project_root and not item.is_placeholder:
                         stack.append(path)
@@ -279,7 +281,5 @@ def _project_markers(path: Path) -> tuple[str, ...]:
         return ()
     marker_names = {name.casefold() for name in PROJECT_MARKERS}
     markers = {name for name in names if name.casefold() in marker_names}
-    markers.update(
-        name for name in names if name.casefold().endswith(PROJECT_MARKER_SUFFIXES)
-    )
+    markers.update(name for name in names if name.casefold().endswith(PROJECT_MARKER_SUFFIXES))
     return tuple(sorted(markers, key=str.casefold))

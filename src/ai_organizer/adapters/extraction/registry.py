@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 import email
+import io
 import os
 import re
 import shutil
@@ -13,6 +15,10 @@ from pathlib import Path
 from typing import ClassVar, Protocol
 from xml.etree import ElementTree
 
+from ai_organizer.adapters.filesystem.metadata import (
+    capture_pdf_diagnostics,
+    pdf_health_issues,
+)
 from ai_organizer.domain.models import Evidence, ItemSnapshot
 
 MAX_TEXT_BYTES = 2_000_000
@@ -49,6 +55,10 @@ class ExtractionRegistry:
         return GenericExtractor().extract(path, item)
 
 
+class _PdfTextPage(Protocol):
+    def extract_text(self, *args: object, **kwargs: object) -> str | None: ...
+
+
 class PdfExtractor:
     name = "pypdf"
 
@@ -61,57 +71,182 @@ class PdfExtractor:
     def extract(self, path: Path, item: ItemSnapshot) -> Evidence:
         from pypdf import PdfReader
 
-        reader = PdfReader(path)
-        if reader.is_encrypted:
-            return Evidence(item.id, "pdf", "Encrypted PDF", facts={"encrypted": True})
-        pages = [(page.extract_text() or "")[:100_000] for page in reader.pages[:50]]
+        with capture_pdf_diagnostics() as messages:
+            reader = PdfReader(path, strict=False)
+            encrypted = bool(reader.is_encrypted)
+            page_count = None if encrypted else len(reader.pages)
+            page_objects = [] if encrypted else list(reader.pages[:50])
+            pages = [] if encrypted else [_extract_pdf_page_text(page) for page in page_objects]
+            document_metadata = {
+                str(key): str(value) for key, value in (reader.metadata or {}).items()
+            }
+        issues = pdf_health_issues(messages)
+        health = {
+            "file_health_status": "warning" if issues else "no_issues_observed",
+            "file_health_issue_count": len(issues),
+            "file_health_issues": issues,
+        }
+        if encrypted:
+            return Evidence(
+                item.id,
+                "pdf",
+                "Encrypted PDF",
+                facts={"encrypted": True, **health},
+            )
+        embedded_pages = list(pages)
         text = "\n".join(pages)[:MAX_TEXT_BYTES]
         page_coverage = [min(1.0, len(value.strip()) / 800) for value in pages]
         coverage = sum(page_coverage) / max(1, len(page_coverage))
-        ocr_candidates = [
-            index for index, value in enumerate(page_coverage) if value < 0.15
-        ][:20]
+        ocr_reasons: dict[str, list[str]] = {}
+        ocr_candidates: list[int] = []
+        for index, (page, page_text) in enumerate(zip(page_objects, pages, strict=True)):
+            image_count = _pdf_page_image_count(page)
+            quality_reasons = _text_quality_reasons(page_text)
+            reasons = []
+            if image_count and len(page_text.strip()) < 120:
+                reasons.append(
+                    "image-backed page has insufficient embedded text"
+                    if page_text.strip()
+                    else "image-backed page has no embedded text"
+                )
+            if quality_reasons:
+                reasons.extend(quality_reasons)
+            if reasons:
+                ocr_candidates.append(index)
+                ocr_reasons[str(index)] = list(dict.fromkeys(reasons))
+            if len(ocr_candidates) >= 20:
+                break
         ocr_used = False
         ocr_available = bool(self.ocr and self.ocr.available())
+        ocr_layout_pages: dict[str, object] = {}
         if ocr_candidates and self.ocr and ocr_available:
-            recognized = self.ocr.recognize_pages(path, ocr_candidates)
-            for page_index, ocr_text in recognized.items():
+            recognized_layout = self.ocr.recognize_pages_with_layout(path, ocr_candidates)
+            for page_index, layout in recognized_layout.items():
+                ocr_text = str(layout.get("text", ""))
                 if ocr_text.strip() and page_index < len(pages):
+                    page = reader.pages[page_index]
+                    layout["pdf_rotation"] = int(page.rotation or 0)
+                    layout["pdf_mediabox"] = [float(value) for value in page.mediabox]
                     pages[page_index] = ocr_text[:100_000]
                     page_coverage[page_index] = min(0.85, len(ocr_text.strip()) / 800)
-            if recognized:
+                    ocr_layout_pages[str(page_index)] = layout
+            if ocr_layout_pages:
                 ocr_used = True
             text = "\n".join(pages)[:MAX_TEXT_BYTES]
             coverage = sum(page_coverage) / max(1, len(page_coverage))
-        remaining_ocr = [
-            index for index, value in enumerate(page_coverage) if value < 0.15
-        ]
-        route = _confidence_route(coverage, bool(remaining_ocr), ocr_available)
+        completed_ocr = sorted(int(value) for value in ocr_layout_pages)
+        remaining_ocr = [index for index in ocr_candidates if index not in completed_ocr]
+        ai_cleanup_pages, ai_cleanup_reasons = _ocr_cleanup_assessment(ocr_layout_pages)
+        route = _confidence_route(
+            coverage,
+            bool(remaining_ocr),
+            ocr_available,
+            ocr_configured=self.ocr is not None,
+        )
         languages = LanguageDetector().detect(text)
         return Evidence(
             item.id,
             "pdf",
             text[:2_000],
             facts={
-                "page_count": len(reader.pages),
+                "page_count": page_count,
                 "pages": pages,
+                "embedded_pages": embedded_pages,
                 "page_text_coverage": page_coverage,
                 "text": text,
                 "text_coverage": coverage,
                 "needs_ocr": bool(remaining_ocr),
                 "ocr_candidate_pages": ocr_candidates,
+                "ocr_candidate_reasons": ocr_reasons,
+                "ocr_completed_pages": completed_ocr,
                 "ocr_remaining_pages": remaining_ocr,
                 "ocr_available": ocr_available,
+                "ocr_availability": (
+                    "available"
+                    if ocr_available
+                    else "unavailable"
+                    if self.ocr is not None
+                    else "not_checked"
+                ),
+                "ocr_attempted": bool(ocr_candidates and self.ocr and ocr_available),
                 "ocr_used": ocr_used,
-                "metadata": {str(k): str(v) for k, v in (reader.metadata or {}).items()},
+                "ocr_layout_pages": ocr_layout_pages,
+                "ai_cleanup_recommended": bool(ai_cleanup_pages),
+                "ai_cleanup_pages": ai_cleanup_pages,
+                "ai_cleanup_reasons": ai_cleanup_reasons,
+                "pdf_text_extraction_mode": "layout",
+                "metadata": document_metadata,
+                **health,
             },
             confidence=coverage,
             language_candidates=languages,
             provenance=self.name,
             confidence_route=route,
             content_classes=["extracted_text"],
-            extractor_version="2",
+            extractor_version="3",
         )
+
+
+def _extract_pdf_page_text(page: _PdfTextPage) -> str:
+    """Prefer pypdf's position-aware layout reconstruction with a compatibility fallback."""
+    try:
+        value = page.extract_text(
+            extraction_mode="layout",
+            layout_mode_space_vertically=False,
+            layout_mode_strip_rotated=False,
+        )
+    except TypeError:
+        value = page.extract_text()
+    return str(value or "")[:100_000]
+
+
+def _pdf_page_image_count(page: object) -> int:
+    try:
+        return sum(1 for _value in getattr(page, "images", ()))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return 0
+
+
+def _text_quality_reasons(text: str) -> list[str]:
+    """Conservative local signals that justify re-OCR, not a claim that AI is required."""
+    value = text.strip()
+    if not value:
+        return []
+    reasons = []
+    printable = sum(character.isprintable() or character in "\r\n\t" for character in value)
+    if printable / max(1, len(value)) < 0.97 or "\ufffd" in value:
+        reasons.append("embedded text contains invalid or non-printable characters")
+    alphanumeric = sum(character.isalnum() for character in value)
+    separators = sum(character.isspace() for character in value)
+    if len(value) >= 80 and alphanumeric >= 60 and separators / max(1, alphanumeric) < 0.015:
+        reasons.append("embedded text has implausibly little word spacing")
+    return reasons
+
+
+def _ocr_cleanup_assessment(
+    layout_pages: dict[str, object],
+) -> tuple[list[int], dict[str, list[str]]]:
+    pages: list[int] = []
+    page_reasons: dict[str, list[str]] = {}
+    for page_key, raw_page in layout_pages.items():
+        if not isinstance(raw_page, dict):
+            continue
+        reasons: list[str] = []
+        lines = [value for value in raw_page.get("lines", []) if isinstance(value, dict)]
+        confidences = [float(value.get("confidence", 0.0)) for value in lines]
+        if confidences and sum(confidences) / len(confidences) < 0.88:
+            reasons.append("average local OCR confidence is below 88%")
+        if any(value < 0.65 for value in confidences):
+            reasons.append("one or more OCR lines have very low confidence")
+        for line in lines:
+            if _text_quality_reasons(str(line.get("text", ""))):
+                reasons.append("OCR line spacing or character quality looks suspicious")
+                break
+        if reasons:
+            page_index = int(raw_page.get("page_index", page_key))
+            pages.append(page_index)
+            page_reasons[str(page_index)] = reasons
+    return sorted(pages), page_reasons
 
 
 class TextExtractor:
@@ -182,7 +317,11 @@ class ImageExtractor:
         with Image.open(path) as image:
             exif = {str(key): str(value) for key, value in image.getexif().items()}
             ocr_available = bool(self.ocr and self.ocr.available())
-            text = self.ocr.recognize(path, ["eng"])[:MAX_TEXT_BYTES] if ocr_available and self.ocr else ""
+            text = (
+                self.ocr.recognize(path, ["eng"])[:MAX_TEXT_BYTES]
+                if ocr_available and self.ocr
+                else ""
+            )
             return Evidence(
                 item.id,
                 "image",
@@ -200,9 +339,15 @@ class ImageExtractor:
                 confidence=0.85 if text.strip() else 0.5,
                 provenance=self.name,
                 confidence_route=(
-                    "needs_review" if text.strip() else "ocr_unavailable" if not ocr_available else "needs_review"
+                    "needs_review"
+                    if text.strip()
+                    else "ocr_unavailable"
+                    if not ocr_available
+                    else "needs_review"
                 ),
-                content_classes=["visual_content", "extracted_text"] if text.strip() else ["visual_content"],
+                content_classes=["visual_content", "extracted_text"]
+                if text.strip()
+                else ["visual_content"],
                 extractor_version="2",
             )
 
@@ -372,10 +517,23 @@ class TesseractOcr:
     def __init__(self, executable: str | None = None) -> None:
         bundled_name = "tesseract.exe" if sys.platform == "win32" else "tesseract"
         bundled = Path(sys.executable).parent / "resources" / "tesseract" / bundled_name
+        system_install = None
+        if sys.platform == "win32":
+            candidates = (
+                Path(os.getenv("PROGRAMFILES", r"C:\Program Files"))
+                / "Tesseract-OCR"
+                / bundled_name,
+                Path(os.getenv("LOCALAPPDATA", "")) / "Programs" / "Tesseract-OCR" / bundled_name,
+            )
+            system_install = next((str(path) for path in candidates if path.is_file()), None)
         self.executable = (
             executable
             or os.getenv("AIORGANIZER_TESSERACT")
-            or (str(bundled) if bundled.exists() else shutil.which("tesseract") or "tesseract")
+            or (
+                str(bundled)
+                if bundled.exists()
+                else shutil.which("tesseract") or system_install or "tesseract"
+            )
         )
         bundled_data = bundled.parent / "tessdata"
         self.environment = os.environ.copy()
@@ -392,10 +550,12 @@ class TesseractOcr:
                 check=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
             )
             first_line = result.stdout.splitlines()[0] if result.stdout else ""
-            match = re.search(r"tesseract\s+(\d+)\.(\d+)", first_line, re.IGNORECASE)
+            match = re.search(r"tesseract\s+v?(\d+)\.(\d+)", first_line, re.IGNORECASE)
             self._available = bool(match and int(match.group(1)) >= 5)
         except (OSError, subprocess.SubprocessError):
             self._available = False
@@ -407,6 +567,8 @@ class TesseractOcr:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
             env=self.environment,
         )
@@ -419,10 +581,38 @@ class TesseractOcr:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=180,
             env=self.environment,
         )
         return result.stdout
+
+    def recognize_layout(
+        self, image: Path, languages: list[str], *, page_index: int = 0
+    ) -> dict[str, object]:
+        result = subprocess.run(
+            [
+                self.executable,
+                str(image),
+                "stdout",
+                "-l",
+                "+".join(languages or ["eng"]),
+                "tsv",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+            env=self.environment,
+        )
+        from PIL import Image
+
+        with Image.open(image) as rendered:
+            width, height = rendered.size
+        return _parse_tesseract_tsv(result.stdout, width, height, page_index)
 
 
 class QtPdfOcr:
@@ -441,27 +631,43 @@ class QtPdfOcr:
             return False
 
     def recognize_pages(self, pdf_path: Path, page_indices: list[int]) -> dict[int, str]:
+        return {
+            page_index: str(layout.get("text", ""))
+            for page_index, layout in self.recognize_pages_with_layout(
+                pdf_path, page_indices
+            ).items()
+        }
+
+    def recognize_pages_with_layout(
+        self, pdf_path: Path, page_indices: list[int]
+    ) -> dict[int, dict[str, object]]:
         from PySide6.QtCore import QSize
         from PySide6.QtPdf import QPdfDocument
 
         document = QPdfDocument()
         if document.load(str(pdf_path)) != QPdfDocument.Error.None_:
             return {}
-        fragments: dict[int, str] = {}
+        fragments: dict[int, dict[str, object]] = {}
         with tempfile.TemporaryDirectory(prefix="aiorganizer-ocr-") as temporary:
-            allowed = sorted(
-                {
-                    page
-                    for page in page_indices
-                    if 0 <= page < document.pageCount()
-                }
-            )[: self.max_pages]
+            allowed = sorted({page for page in page_indices if 0 <= page < document.pageCount()})[
+                : self.max_pages
+            ]
             for page in allowed:
-                image = document.render(page, QSize(1800, 2400))
+                points = document.pagePointSize(page)
+                target_width = max(1, round(points.width() / 72 * 220))
+                target_height = max(1, round(points.height() / 72 * 220))
+                scale = min(1.0, 3200 / max(target_width, target_height))
+                render_size = QSize(
+                    max(1, round(target_width * scale)),
+                    max(1, round(target_height * scale)),
+                )
+                image = document.render(page, render_size)
                 image_path = Path(temporary) / f"page-{page:04d}.png"
                 if image.isNull() or not image.save(str(image_path), "PNG"):
                     continue
-                fragments[page] = self.tesseract.recognize(image_path, ["eng"])
+                fragments[page] = self.tesseract.recognize_layout(
+                    image_path, ["eng"], page_index=page
+                )
         document.close()
         return fragments
 
@@ -469,13 +675,82 @@ class QtPdfOcr:
         return "\n".join(self.recognize_pages(pdf_path, list(range(self.max_pages))).values())
 
 
-def default_registry() -> ExtractionRegistry:
+def _parse_tesseract_tsv(
+    text: str, image_width: int, image_height: int, page_index: int
+) -> dict[str, object]:
+    """Convert Tesseract word boxes into stable, normalized positioned lines."""
+    groups: dict[tuple[int, int, int], list[dict[str, object]]] = {}
+    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+    for row in reader:
+        word = str(row.get("text", "")).strip()
+        if not word or str(row.get("level", "")) != "5":
+            continue
+        try:
+            key = (int(row["block_num"]), int(row["par_num"]), int(row["line_num"]))
+            groups.setdefault(key, []).append(
+                {
+                    "text": word,
+                    "left": int(row["left"]),
+                    "top": int(row["top"]),
+                    "width": int(row["width"]),
+                    "height": int(row["height"]),
+                    "confidence": max(0.0, float(row.get("conf", 0.0))) / 100,
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    lines: list[dict[str, object]] = []
+    for (block, paragraph, line), words in sorted(groups.items()):
+        left = min(int(word["left"]) for word in words)
+        top = min(int(word["top"]) for word in words)
+        right = max(int(word["left"]) + int(word["width"]) for word in words)
+        bottom = max(int(word["top"]) + int(word["height"]) for word in words)
+        lines.append(
+            {
+                "line_id": f"b{block:03d}-p{paragraph:03d}-l{line:03d}",
+                "text": " ".join(str(word["text"]) for word in words),
+                "bounds": [
+                    left / max(1, image_width),
+                    top / max(1, image_height),
+                    (right - left) / max(1, image_width),
+                    (bottom - top) / max(1, image_height),
+                ],
+                "confidence": sum(float(word["confidence"]) for word in words) / len(words),
+                "word_count": len(words),
+                "words": [
+                    {
+                        "text": str(word["text"]),
+                        "bounds": [
+                            int(word["left"]) / max(1, image_width),
+                            int(word["top"]) / max(1, image_height),
+                            int(word["width"]) / max(1, image_width),
+                            int(word["height"]) / max(1, image_height),
+                        ],
+                        "confidence": float(word["confidence"]),
+                    }
+                    for word in words
+                ],
+            }
+        )
+    return {
+        "page_index": page_index,
+        "image_width": image_width,
+        "image_height": image_height,
+        "coordinate_space": "normalized_top_left",
+        "text": "\n".join(str(line["text"]) for line in lines),
+        "lines": lines,
+    }
+
+
+def default_registry(*, enable_ocr: bool = False) -> ExtractionRegistry:
     tesseract = TesseractOcr()
+    pdf_ocr = QtPdfOcr(tesseract) if enable_ocr else None
+    image_ocr = tesseract if enable_ocr else None
     return ExtractionRegistry(
         [
-            PdfExtractor(QtPdfOcr(tesseract)),
+            PdfExtractor(pdf_ocr),
             TextExtractor(),
-            ImageExtractor(tesseract),
+            ImageExtractor(image_ocr),
             OfficeContainerExtractor(),
             EmailExtractor(),
             ArchiveExtractor(),
@@ -485,7 +760,15 @@ def default_registry() -> ExtractionRegistry:
     )
 
 
-def _confidence_route(coverage: float, needs_ocr: bool, ocr_available: bool) -> str:
+def _confidence_route(
+    coverage: float,
+    needs_ocr: bool,
+    ocr_available: bool,
+    *,
+    ocr_configured: bool = True,
+) -> str:
+    if needs_ocr and not ocr_configured:
+        return "local_ocr_not_run"
     if needs_ocr and not ocr_available:
         return "ocr_unavailable"
     if needs_ocr:

@@ -7,9 +7,7 @@ from ai_organizer.domain.hierarchy import (
 )
 
 
-def project(
-    current: set[str], changes: list[HierarchyChange], *, case_sensitive: bool = True
-):
+def project(current: set[str], changes: list[HierarchyChange], *, case_sensitive: bool = True):
     return UnionHierarchyPlanner().project(
         "root",
         current,

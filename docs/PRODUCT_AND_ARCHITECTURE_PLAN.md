@@ -1,5 +1,10 @@
 # AI Organizer: Product and Architecture Plan
 
+Searchable PDF generation is intentionally separated from ordinary extraction. See
+[the OCR searchable-PDF safety boundary](OCR_SEARCHABLE_PDF_DESIGN.md).
+Personal-content cloud boundaries are defined in
+[the local privacy and redaction design](PRIVATE_REDACTION_DESIGN.md).
+
 Status: Phase 0–5 implementation baseline
 Date: 2026-07-15
 Scope: local files, folder planning, focused actions, moves, cleanup, and reviewed recurring-document tracking; Outlook follows in a staged release
@@ -354,12 +359,41 @@ Source code and complete software projects use separate rules. The general renam
 
 The main window contains:
 
-- workspace/source selector and scan status
-- left navigation: Overview, Inventory, Rename, Folder Plan, Move, Cleanup, Recurrences, Email, Activity
+- a mutually exclusive **Files & Folders / Mail / System** mode switch in the menu
+- in Files & Folders mode, left navigation for Overview, Sources, Inventory, Audit, Updates,
+  Document Repair, Rename, Folder Plan, Move, Cleanup, Recurrences, Focused Actions, Activity, and
+  Settings
+- in Mail mode, a separate left tool list for Folder Proposals, Rule Proposals, Focused Actions, and
+  mode-aware Settings; mail is not a file-tool tab
+- in Windows System mode, a separate left tool list for Applications, Drivers, Windows Update,
+  Health, and mode-aware Settings; assessment is read-only until a later reviewed apply workflow
 - central task-specific review surface
 - collapsible evidence/preview inspector
 - durable job/activity drawer
 - a clear privacy/provider indicator
+
+Inventory and file-backed review tools share a visible **Focus** control. It uses a checkable,
+multi-source list plus path and file-type/MIME filters. Filtering happens before proposal generation
+so testing can safely target a small slice even when a source contains tens of thousands of files;
+transaction validation still consults the complete inventory and source boundaries.
+
+Adding a source is deliberately minimal: selecting a folder creates an unclassified root with no
+category, tag, or routing-role assumptions. Inventory and Audit may inspect that root, but operational
+tools do not offer it until the user manually classifies it or approves an Audit source-policy proposal.
+Audit may apply reviewed categories, tags, and routing roles; it never applies filesystem changes.
+Excluded sources remain non-operational even though their exclusion is an approved classification.
+
+Every mail tool follows the file review shape: a sortable multi-column list on the left and a tabbed
+mail inspector on the right for bounded preview, sender/recipient/time/flag metadata, attachment
+metadata, and proposal rationale. Folder proposals create, rename, or move mail folders. Rule proposals
+use reviewed historical samples and are applied separately. Focused Actions gathers cautious local
+review candidates for task-like mail, registration/security evidence, attachments without an organizer
+save record, and Outlook handoffs.
+
+Settings are mode-filtered. General workspace guidance, accessibility/language, privacy/redaction, and
+provider credentials are common. File tool guidance appears only in Files & Folders mode; mail folder,
+rule, focused-action, and Outlook-permission settings appear only in Mail mode; Windows application,
+driver, OS-update, health, and safety settings appear only in System mode.
 
 The application always distinguishes “analyzed,” “proposed,” “accepted,” and “applied.” Counts use those exact states.
 
@@ -418,6 +452,10 @@ Permanent deletion is not part of the initial cleanup implementation.
 ## 11. Folder organization strategy
 
 The organizer should propose stable, shallow structures rather than constructing deep AI-generated taxonomies that are hard to maintain.
+
+Source discovery and browsing traverse the configured root without a default hierarchy-depth limit.
+Depth policy belongs to proposed organization only: Folder Plan cannot propose or commit a hierarchy
+deeper than the applicable workspace/category ceiling.
 
 The hierarchy engine uses:
 
@@ -617,6 +655,10 @@ Initial capabilities:
 - propose inbox rules and test each against a historical sample;
 - identify likely registration, welcome, verification, security-alert, password-reset, MFA, billing, and cancellation messages;
 - match downloadable document attachments to recurring series.
+
+Mail uses a purpose-built message inspector rather than the filesystem preview. It shows sender and
+recipient metadata, received/sent times, read and follow-up state, importance, categories, folder,
+conversation identifiers, attachment presence, and the bounded redacted preview retained by policy.
 
 Mailbox IDs can change after moves, so store immutable IDs when supported and still validate remote state before apply. Use delta queries for refresh rather than repeatedly downloading an entire mailbox.
 
@@ -851,6 +893,14 @@ Deliver:
 - onboarding, backup/export, accessibility, localization groundwork
 - contribution guide, plugin/provider contracts, SBOM, and signed releases
 
+### Post-desktop roadmap: publishable mobile clients
+
+Only after the desktop application is fully portable, stable, and release-signed should work begin on
+publishable Android and iPhone/iOS clients. Mobile is a distinct product surface with sandboxed storage,
+share-sheet/document-provider integration, mobile authentication, background-execution limits, and
+store privacy/review requirements. Reuse the domain contracts and proposal formats where practical;
+do not begin mobile UI or platform code during desktop stabilization.
+
 The rough total for one experienced full-time developer is several months, not several weekends. The visible UI is manageable; reliable transactions, recovery, privacy, platform edge cases, OCR quality, and mailbox permissions contain most of the work.
 
 ## 21. Initial backlog
@@ -876,7 +926,7 @@ The first implementation backlog, in order, should be:
 - exact open-source license (Apache-2.0 is a reasonable default, subject to dependency/license review)
 - local-model runtime and supported model list
 - cloud synchronization of organizer metadata
-- mobile or web client
+- web client (Android and iPhone/iOS clients are explicitly post-desktop roadmap work)
 - permanent deletion
 - password-manager integration
 - generic IMAP support

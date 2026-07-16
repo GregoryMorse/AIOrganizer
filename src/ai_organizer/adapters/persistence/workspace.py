@@ -470,9 +470,7 @@ class WorkspaceStore:
     def list_tag_definition_payloads(self) -> list[dict[str, Any]]:
         return [
             json.loads(row[0])
-            for row in self.connection.execute(
-                "SELECT payload FROM tag_definitions ORDER BY id"
-            )
+            for row in self.connection.execute("SELECT payload FROM tag_definitions ORDER BY id")
         ]
 
     def save_tag_assignment(self, assignment: TagAssignment) -> None:
@@ -505,7 +503,8 @@ class WorkspaceStore:
         return [
             json.loads(row[0])
             for row in self.connection.execute(
-                "SELECT payload FROM tag_assignments" + where
+                "SELECT payload FROM tag_assignments"
+                + where
                 + " ORDER BY entity_kind,entity_key,tag_id",
                 parameters,
             )
@@ -626,8 +625,7 @@ class WorkspaceStore:
     def metadata_cache_records(self) -> dict[tuple[str, str], dict[str, Any]]:
         """Return a thread-safe value snapshot; no SQLite objects escape this method."""
         rows = self.connection.execute(
-            "SELECT root_id,relative_path,fingerprint,payload,updated_at "
-            "FROM metadata_cache"
+            "SELECT root_id,relative_path,fingerprint,payload,updated_at FROM metadata_cache"
         )
         return {
             (str(row["root_id"]), str(row["relative_path"])): {
@@ -638,9 +636,7 @@ class WorkspaceStore:
             for row in rows
         }
 
-    def save_cached_metadata(
-        self, item: ItemSnapshot, payload: dict[str, Any]
-    ) -> dict[str, Any]:
+    def save_cached_metadata(self, item: ItemSnapshot, payload: dict[str, Any]) -> dict[str, Any]:
         return self.save_cached_metadata_batch([(item, payload)])[
             (item.root_id, item.relative_path)
         ]
@@ -797,9 +793,7 @@ class WorkspaceStore:
         return len(stale)
 
     def metadata_cache_stats(self) -> dict[str, Any]:
-        row = self.connection.execute(
-            "SELECT COUNT(*) AS records FROM metadata_cache"
-        ).fetchone()
+        row = self.connection.execute("SELECT COUNT(*) AS records FROM metadata_cache").fetchone()
         archive_members = int(
             self.connection.execute("SELECT COUNT(*) FROM archive_members").fetchone()[0]
         )
@@ -1265,7 +1259,9 @@ class WorkspaceStore:
         ).fetchone()
         if not row:
             return None
-        active = row["status"] == "active" and datetime.fromisoformat(row["expires_at"]) > datetime.now(UTC)
+        active = row["status"] == "active" and datetime.fromisoformat(
+            row["expires_at"]
+        ) > datetime.now(UTC)
         if not active and row["status"] == "active":
             self.connection.execute(
                 "UPDATE selection_scopes SET status='expired' WHERE id=?", (scope_id,)

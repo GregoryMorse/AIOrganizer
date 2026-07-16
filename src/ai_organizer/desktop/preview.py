@@ -396,9 +396,13 @@ class FilePreview(QWidget):
         self.open_button = QPushButton("Open externally")
         self.open_button.setToolTip("Open this document with its operating-system application")
         self.open_button.clicked.connect(self._open_external)
+        self.reveal_button = QPushButton("Containing folder")
+        self.reveal_button.setToolTip("Open the folder containing the selected inventory item")
+        self.reveal_button.clicked.connect(self._reveal_in_folder)
         header.addWidget(self.zoom_out_button)
         header.addWidget(self.zoom_reset_button)
         header.addWidget(self.zoom_in_button)
+        header.addWidget(self.reveal_button)
         header.addWidget(self.open_button)
         layout.addLayout(header)
 
@@ -518,6 +522,7 @@ class FilePreview(QWidget):
         self.message.setText("Select a file to preview it.")
         self.preview_stack.setCurrentWidget(self.message)
         self.text.clear()
+        self.tabs.setTabText(self.tabs.indexOf(self.text), "Text / Code")
         self.metadata_table.setRowCount(0)
         self.archive_table.setRowCount(0)
         self.archive_filter.clear()
@@ -529,6 +534,7 @@ class FilePreview(QWidget):
         self.tabs.setTabVisible(self.archive_tab_index, False)
         self.tabs.setTabVisible(self.hex_tab_index, False)
         self.open_button.setEnabled(False)
+        self.reveal_button.setEnabled(False)
         self._update_zoom_buttons()
 
     def show_record(self, record: dict[str, Any], *, caption: str = "Indexed record") -> None:
@@ -550,6 +556,7 @@ class FilePreview(QWidget):
         member_page: dict[str, Any] | None = None,
         member_loader: ArchiveLoader | None = None,
         record: dict[str, Any] | None = None,
+        extracted_text: str | None = None,
     ) -> None:
         self.clear()
         self._path = path
@@ -573,14 +580,29 @@ class FilePreview(QWidget):
         self._archive_loader = member_loader
         self.tabs.setTabVisible(self.hex_tab_index, True)
         self.open_button.setEnabled(suffix not in _UNSAFE_EXTERNAL_EXTENSIONS)
+        self.reveal_button.setEnabled(True)
         self._populate_archive(member_page)
         if suffix in _ARCHIVE_EXTENSIONS or (metadata or {}).get("archive_format"):
             self.tabs.setTabVisible(self.archive_tab_index, True)
 
         if suffix == ".pdf":
             self._show_pdf(path)
+            self.tabs.setTabText(self.tabs.indexOf(self.text), "Extracted / OCR Text")
+            if extracted_text is not None:
+                self._set_text(
+                    extracted_text[:_MAX_TEXT_BYTES],
+                    len(extracted_text) > _MAX_TEXT_BYTES,
+                    code=False,
+                )
         elif suffix in _IMAGE_EXTENSIONS:
             self._show_image(path)
+            if extracted_text is not None:
+                self.tabs.setTabText(self.tabs.indexOf(self.text), "Extracted / OCR Text")
+                self._set_text(
+                    extracted_text[:_MAX_TEXT_BYTES],
+                    len(extracted_text) > _MAX_TEXT_BYTES,
+                    code=False,
+                )
         elif suffix in _MARKDOWN_EXTENSIONS:
             self._show_markdown(path)
         elif suffix in _CODE_EXTENSIONS or suffix in _TEXT_EXTENSIONS:
@@ -909,6 +931,10 @@ class FilePreview(QWidget):
         if self._path and self._path.suffix.casefold() not in _UNSAFE_EXTERNAL_EXTENSIONS:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._path)))
 
+    def _reveal_in_folder(self) -> None:
+        if self._path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._path.parent)))
+
     def _open_safe_link(self, url: QUrl) -> None:
         if url.scheme().casefold() in {"https", "http"}:
             QDesktopServices.openUrl(url)
@@ -923,6 +949,61 @@ class FilePreview(QWidget):
             event.accept()
             return
         super().keyPressEvent(event)
+
+
+class DocumentRepairPreview(FilePreview):
+    """PDF inspector with separate, non-destructive OCR and compression proposal views."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.proposed_ocr = QPlainTextEdit()
+        self.proposed_ocr.setReadOnly(True)
+        self.proposed_ocr.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.proposed_ocr.setFont(QFont("Consolas"))
+        self.proposed_ocr.setPlaceholderText("No OCR text proposal has been generated.")
+        self.proposed_ocr_tab_index = self.tabs.addTab(self.proposed_ocr, "Proposed OCR Text")
+
+        self.compression_stack = QStackedWidget()
+        self.compression_message = QLabel("No image-compression proposal has been generated.")
+        self.compression_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.compression_message.setWordWrap(True)
+        self.proposed_pdf_document = QPdfDocument(self)
+        self.proposed_pdf = PannablePdfView()
+        self.proposed_pdf.setDocument(self.proposed_pdf_document)
+        self.compression_stack.addWidget(self.compression_message)
+        self.compression_stack.addWidget(self.proposed_pdf)
+        self.proposed_compression_tab_index = self.tabs.addTab(
+            self.compression_stack, "Proposed Compression"
+        )
+
+    def clear(self) -> None:
+        super().clear()
+        if hasattr(self, "proposed_ocr"):
+            self.proposed_ocr.clear()
+        if hasattr(self, "proposed_pdf_document"):
+            self.proposed_pdf_document.close()
+            self.compression_message.setText("No image-compression proposal has been generated.")
+            self.compression_stack.setCurrentWidget(self.compression_message)
+
+    def set_repair_proposals(
+        self,
+        *,
+        proposed_ocr_text: str,
+        compression_path: Path | None,
+        compression_summary: str,
+    ) -> None:
+        self.proposed_ocr.setPlainText(proposed_ocr_text[:_MAX_TEXT_BYTES])
+        self.proposed_ocr.setProperty("truncated", len(proposed_ocr_text) > _MAX_TEXT_BYTES)
+        self.proposed_pdf_document.close()
+        if compression_path and compression_path.is_file():
+            error = self.proposed_pdf_document.load(str(compression_path))
+            if error == QPdfDocument.Error.None_:
+                self.compression_stack.setCurrentWidget(self.proposed_pdf)
+                self.proposed_pdf.setToolTip(compression_summary)
+                return
+            compression_summary = f"{compression_summary}\nPreview error: {error.name}"
+        self.compression_message.setText(compression_summary)
+        self.compression_stack.setCurrentWidget(self.compression_message)
 
 
 def _table(headers: list[str], accessible_name: str) -> QTableWidget:

@@ -75,14 +75,20 @@ def main() -> int:
     tesseract_bundle = os.getenv("AIORGANIZER_TESSERACT_BUNDLE", "")
     if tesseract_bundle:
         bundle_path = Path(tesseract_bundle).resolve(strict=True)
-        shutil.copytree(bundle_path, build_dir / "resources" / "tesseract")
+        shutil.copytree(
+            bundle_path,
+            build_dir / "resources" / "tesseract",
+            dirs_exist_ok=True,
+        )
     signing = (
         "Platform signature verification was required by the release workflow."
         if os.getenv("AIORGANIZER_SIGNED_BUILD") == "1"
         else "This development artifact has no platform code signature; security warnings may appear."
     )
     (build_dir / "ALPHA-NOTICE.txt").write_text(
-        "AIOrganizer v0.1.0 alpha. " + signing + " Test with copied data first. Cross-volume source "
+        "AIOrganizer v0.1.0 alpha. "
+        + signing
+        + " Test with copied data first. Cross-volume source "
         "quarantine is retained indefinitely until explicit Cleanup review.\n",
         encoding="utf-8",
     )

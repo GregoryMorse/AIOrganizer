@@ -31,8 +31,7 @@ def test_general_profile_has_referentially_sound_multi_axis_vocabulary() -> None
         "audience",
     }
     assert all(
-        value.parent_id is None or value.parent_id in category_ids
-        for value in profile.categories
+        value.parent_id is None or value.parent_id in category_ids for value in profile.categories
     )
     assert all(value.default_tag_ids <= tag_ids for value in profile.categories)
     assert any(value.suggest_as_folder for value in profile.categories)
@@ -85,8 +84,9 @@ def test_tag_definitions_and_assignments_round_trip_in_workspace(tmp_path) -> No
         )
     )
 
-    assert controller.store.list_tag_assignment_payloads("folder", "root:legacy")[0][
-        "tag_id"
-    ] == tag["id"]
+    assert (
+        controller.store.list_tag_assignment_payloads("folder", "root:legacy")[0]["tag_id"]
+        == tag["id"]
+    )
     assert tag["id"] in controller.store.list_assignment_payloads()[0]["tag_ids"]
     controller.close()

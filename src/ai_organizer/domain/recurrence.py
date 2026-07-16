@@ -81,7 +81,9 @@ class RecurrenceSeries:
             raise ValueError("Grace period must be between 0 and 180 days")
         if not self.name.strip() or not self.issuer.strip() or not self.document_type.strip():
             raise ValueError("Series name, issuer, and document type are required")
-        if self.masked_account_id and not re.fullmatch(r"(?:••••|\*{4})\d{2,6}", self.masked_account_id):
+        if self.masked_account_id and not re.fullmatch(
+            r"(?:••••|\*{4})\d{2,6}", self.masked_account_id
+        ):
             raise ValueError("Account identifiers must contain only a masked suffix")
 
 
@@ -143,12 +145,16 @@ class SeriesCandidateBuilder:
         evidence_by_item: dict[str, list[dict[str, Any]]] | None = None,
     ) -> list[SeriesCandidate]:
         evidence_by_item = evidence_by_item or {}
-        grouped: dict[str, list[tuple[dict[str, Any], date, float, tuple[str, ...]]]] = defaultdict(list)
+        grouped: dict[str, list[tuple[dict[str, Any], date, float, tuple[str, ...]]]] = defaultdict(
+            list
+        )
         identities: dict[str, tuple[str, str, str, str]] = {}
         for item in items:
             if item.get("is_dir"):
                 continue
-            filename = str(item.get("name") or str(item.get("relative_path", "")).rsplit("/", 1)[-1])
+            filename = str(
+                item.get("name") or str(item.get("relative_path", "")).rsplit("/", 1)[-1]
+            )
             period, period_evidence = _period_from_item(
                 filename, evidence_by_item.get(str(item.get("id", "")), [])
             )
@@ -162,7 +168,17 @@ class SeriesCandidateBuilder:
             issuer = _issuer(normalized, document_type)
             if not issuer:
                 continue
-            masked = _masked_account(" ".join([filename, *[str(value.get("summary", "")) for value in evidence_by_item.get(str(item.get("id", "")), [])]]))
+            masked = _masked_account(
+                " ".join(
+                    [
+                        filename,
+                        *[
+                            str(value.get("summary", ""))
+                            for value in evidence_by_item.get(str(item.get("id", "")), [])
+                        ],
+                    ]
+                )
+            )
             fingerprint = hashlib.sha256(
                 f"{issuer.casefold()}|{document_type.casefold()}|{masked}|{_stable_words(normalized)}".encode()
             ).hexdigest()[:24]
@@ -191,7 +207,9 @@ class SeriesCandidateBuilder:
                     str(item.get("relative_path", "")),
                     f"{item.get('size', 0)}:{item.get('modified_ns', 0)}",
                 )
-                for item, period, confidence, evidence in sorted(members, key=lambda value: value[1])
+                for item, period, confidence, evidence in sorted(
+                    members, key=lambda value: value[1]
+                )
             )
             candidates.append(
                 SeriesCandidate(
@@ -260,7 +278,9 @@ class GapMatrix:
                 explanation = f"The {period_label(current, series.cadence)} period has not ended."
             elif today <= due:
                 status = GapStatus.WITHIN_GRACE
-                explanation = f"The period ended but remains inside the {series.grace_days}-day grace window."
+                explanation = (
+                    f"The period ended but remains inside the {series.grace_days}-day grace window."
+                )
             else:
                 status = GapStatus.MISSING
                 explanation = (
@@ -343,8 +363,18 @@ def parse_period(value: str) -> date | None:
     if numeric:
         return date(int(numeric.group(1)), int(numeric.group(2)), 1)
     months = {
-        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
     }
     named = re.search(
         r"(?i)(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
@@ -380,9 +410,7 @@ def period_label(value: date, cadence: Cadence) -> str:
     return str(value.year)
 
 
-def _period_from_item(
-    filename: str, evidence: list[dict[str, Any]]
-) -> tuple[date | None, str]:
+def _period_from_item(filename: str, evidence: list[dict[str, Any]]) -> tuple[date | None, str]:
     for record in evidence:
         facts = record.get("facts", {})
         for key in ("statement_period", "coverage_period", "period", "period_start"):
@@ -408,7 +436,17 @@ def _without_period(value: str) -> str:
 
 def _document_type(value: str) -> str:
     folded = value.casefold()
-    for kind in ("bank statement", "credit card statement", "statement", "invoice", "payslip", "pay stub", "bill", "report", "receipt"):
+    for kind in (
+        "bank statement",
+        "credit card statement",
+        "statement",
+        "invoice",
+        "payslip",
+        "pay stub",
+        "bill",
+        "report",
+        "receipt",
+    ):
         if kind in folded:
             return kind.title()
     return ""
@@ -471,9 +509,7 @@ def recurrence_series_from_payload(payload: dict[str, Any]) -> RecurrenceSeries:
 def rebind_observations(
     observations: Iterable[SeriesObservation], items: Iterable[dict[str, Any]]
 ) -> tuple[SeriesObservation, ...]:
-    current_by_path = {
-        (str(item["root_id"]), str(item["relative_path"])): item for item in items
-    }
+    current_by_path = {(str(item["root_id"]), str(item["relative_path"])): item for item in items}
     rebound: list[SeriesObservation] = []
     for observation in observations:
         if not observation.root_id or not observation.relative_path:
@@ -484,8 +520,7 @@ def rebind_observations(
             continue
         fingerprint = f"{item.get('size', 0)}:{item.get('modified_ns', 0)}"
         changed = bool(
-            observation.source_fingerprint
-            and observation.source_fingerprint != fingerprint
+            observation.source_fingerprint and observation.source_fingerprint != fingerprint
         )
         rebound.append(
             SeriesObservation(

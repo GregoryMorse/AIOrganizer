@@ -30,9 +30,7 @@ class BackgroundTaskWorker(QObject):
     def run(self) -> None:
         try:
             value = (
-                self.operation(self.report_progress)
-                if self.progress_aware
-                else self.operation()
+                self.operation(self.report_progress) if self.progress_aware else self.operation()
             )
             self.completed.emit(value)
         except Exception as error:

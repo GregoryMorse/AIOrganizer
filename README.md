@@ -15,9 +15,10 @@ plan.
 - User-defined hierarchical categories and enforced folder roles
 - Inventory audits that propose naming, cleanup, and project-handling guidance from observed patterns
 - Durable semantic records with freshness state, provenance, and preserved update-site hints
-- OS-specific installed-software inventory and downloaded-installer correlation in Updates
+- Separate downloaded-artifact Updates and Windows System application/driver/update/health checks
 - Versioned, layered AI guidance for each application view
 - Inventory and content evidence for common file formats
+- Staged PDF Document Repair with local OCR and cache-only compression previews
 - Rename, folder-plan, and cross-source move proposals
 - Reviewed recurring-document series with explainable period coverage and gap exceptions
 - Focused security and organization actions
@@ -25,6 +26,10 @@ plan.
 - Journaled operations, verification, recovery records, quarantine, and undo plans
 - First-run safety onboarding, workspace backup, review export, and private-data-free diagnostics
 - Experimental metadata-only Office.js Outlook selection companion
+- Separate Files & Folders, Mail, and Windows System modes with mode-aware Settings.
+  System mode covers application updates, installed drivers, Windows Update, storage health,
+  and explicit read-only fragmentation analysis.
+- Shared multi-source/path/file-type focus controls for large inventories and safe test slices
 - Accessibility preferences, Qt localization catalogs, contributor/provider contracts, and release attestations
 
 The project is Windows-first and is tested on Windows, macOS, and Linux. It is
@@ -103,6 +108,12 @@ desktop launch automatically registers a stable `aiorganizer` server with Codex 
 is installed. The checked-in `.vscode/mcp.json` also makes the server available when this repository
 is opened in VS Code. Hosts retain their normal workspace/server trust prompt.
 
+Read-only storage tools enumerate mounted volumes, capacity/free space, configured-source coverage,
+and bounded volume-relative directory names/stat metadata. They never read file content or add a
+source. Audit can use this evidence to propose categories, tags, and routing roles for an existing
+unclassified source, or recommend a possible new source. Applying a reviewed source classification
+never changes files, and every source addition remains an explicit desktop decision.
+
 Whenever a workspace is created or opened, the app publishes its path to a small per-user state
 file. Automatically launched MCP processes read that pointer, so switching workspaces requires no
 host reconfiguration. Set `AIORGANIZER_AUTO_REGISTER_MCP=0` before launch to disable automatic
@@ -154,6 +165,12 @@ matched against missing reviewed recurrence periods without downloading the atta
 The automatically registered MCP server exposes bounded read-only views of the local mail cache:
 summary, folders, sanitized messages, attachment descriptors, and Accounts & Security Evidence.
 Those tools never contact Graph, return credentials, download attachment bytes, or apply mail changes.
+
+Mail Folder Proposals stage folder creation, rename, and move operations. Rule Proposals use an
+explicitly selected historical message to create a narrow reviewed Inbox rule. Focused Actions locally
+surfaces task-like or flagged mail, registration/security evidence, attachment metadata with no recorded
+save, and imported Outlook selections. These are cautious review findings, not claims that a task was
+forgotten or an attachment is definitely unsaved.
 
 The automated Phase 6 suite uses a fake Graph transport for paging, delta, permission, conflict, and
 no-send/no-delete checks. A real test-tenant soak remains an explicit release gate and is not run by
@@ -249,6 +266,12 @@ content counts, source policies, redactions, byte size, and estimated tokens. Pr
 validated against a strict local schema before they can alter a proposal, and AI changes always
 enter `needs_review` rather than becoming accepted.
 
+Settings includes a **Privacy & Redaction** list stored in the operating-system credential store.
+Built-in masking covers credentials, private keys, contextual security codes, IBANs, and formatted
+long account/card identifiers; exact user-supplied private values are removed from every direct
+provider request. Raw personal OCR and images remain local by default. See
+[`docs/PRIVATE_REDACTION_DESIGN.md`](docs/PRIVATE_REDACTION_DESIGN.md).
+
 The host model chooses and calls tools exposed by that child process. MCP hosts may use their own
 browsing/search capability. The desktop's direct DeepSeek/OpenRouter Updates flow instead supplies bounded public
 HTTPS search and visible-page-text tools itself, along with preserved semantic hints and a strict JSON
@@ -260,12 +283,17 @@ back through AI re-audit; no returned code is executed.
 Organization policy is multi-axis: semantic categories answer what material is, facet tags capture
 content/lifecycle/state/origin/technology/audience properties, and source roles control workflow authority.
 New workspaces include a general-purpose profile and existing workspaces can merge it explicitly. Reusable
-source presets configure common inbox, software, repository, dependency, personal, research, education,
-teaching, and legacy-migration cases without hardcoded paths. Folder Plan uses a preferred depth plus a hard
-workspace/source/category ceiling; adaptive AI may choose a shallower structure but never a deeper one.
+source presets remain available for manual classification of common inbox, software, repository,
+dependency, personal, research, education, teaching, and legacy-migration cases without hardcoded
+paths. Newly added sources start unclassified and are available only to Inventory and Audit until a
+user manually classifies them or approves an Audit proposal. Source inventory browsing is unlimited
+in depth. Folder Plan alone uses a preferred depth plus a hard workspace/category proposal ceiling;
+adaptive AI may choose a shallower proposed structure but never a deeper one.
 
-The Updates page keeps installed software separate from Download-category files. On Windows it
-can correlate those files with current and past Microsoft Defender detections. The result is stored
+Files & Folders Updates tracks Download-category software archives, papers, articles, and recurring
+publications. Installed applications and their release research live in System mode alongside driver
+and OS update checks. On Windows, file Updates can correlate downloads with current and past Microsoft
+Defender detections. The result is stored
 both as semantic history and directly in each file's metadata. “No matching detection history” is
 intentionally not presented as “clean,” and AIOrganizer does not start a Defender scan or alter
 Defender settings.
@@ -285,6 +313,13 @@ timestamps, CRC, encryption, directory, and format-specific fields are stored in
 paginated database table and exposed through the Inventory preview and
 `inventory_list_archive_members` MCP tool. RAR header listing uses `rarfile`; no external unrar
 executable is needed unless future functionality actually decompresses content.
+
+Recoverable parser diagnostics are stored as file-health metadata instead of being printed and
+discarded. Inventory and Updates expose sortable health/status counts, while MCP summary and issue
+tools group bounded warning/error details. A warning means a parser recovered from a nonstandard or
+inconsistent structure; it is not automatically labeled corruption. Searchable-PDF write-back is a
+separate future focused action because adding an OCR layer necessarily creates a derived file; see
+[`docs/OCR_SEARCHABLE_PDF_DESIGN.md`](docs/OCR_SEARCHABLE_PDF_DESIGN.md).
 
 ## Safety boundary
 

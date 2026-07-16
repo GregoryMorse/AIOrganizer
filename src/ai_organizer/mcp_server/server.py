@@ -14,6 +14,7 @@ from ai_organizer.application.inventory_query import InventoryQueryService
 from ai_organizer.bootstrap.environment import load_development_env
 from ai_organizer.bootstrap.workspace_locator import read_active_workspace
 from ai_organizer.domain.models import (
+    CloudPolicy,
     ItemSnapshot,
     ProposalItem,
     ProposalKind,
@@ -44,8 +45,17 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
 
     store = WorkspaceStore(workspace_path)
 
-    def inventory_query() -> InventoryQueryService:
-        items = store.list_items()
+    def inventory_query(root_filter: set[str] | None = None) -> InventoryQueryService:
+        items = [
+            value
+            for value in store.list_items()
+            if root_filter is None or str(value.get("root_id", "")) in root_filter
+        ]
+        sources = [
+            value
+            for value in store.list_source_payloads()
+            if root_filter is None or str(value.get("id", "")) in root_filter
+        ]
         tags_by_item: dict[str, set[str]] = {}
         for assignment in store.list_tag_assignment_payloads("inventory"):
             if assignment.get("approved", True):
@@ -69,16 +79,20 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
         ]
         raw_depth = store.get_meta("folder_depth_policy")
         try:
-            depth = json.loads(raw_depth) if raw_depth else {
-                "preferred_depth": 2,
-                "maximum_depth": 3,
-                "adaptive": True,
-            }
+            depth = (
+                json.loads(raw_depth)
+                if raw_depth
+                else {
+                    "preferred_depth": 2,
+                    "maximum_depth": 3,
+                    "adaptive": True,
+                }
+            )
         except json.JSONDecodeError:
             depth = {"preferred_depth": 2, "maximum_depth": 3, "adaptive": True}
         return InventoryQueryService(
             tagged_items,
-            store.list_source_payloads(),
+            sources,
             store.metadata_cache_stats(),
             {
                 "categories": store.list_category_payloads(),
@@ -107,22 +121,18 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
             source = sources.get(str(item.get("root_id", "")))
             if not source:
                 continue
-            path = (Path(source["path"]) / str(item.get("relative_path", ""))).resolve(
-                strict=False
-            )
+            path = (Path(source["path"]) / str(item.get("relative_path", ""))).resolve(strict=False)
             root_download = "downloads" in {str(role) for role in source.get("roles", [])} or bool(
                 {str(value) for value in source.get("category_ids", [])} & download_categories
             )
-            if root_download or any(path == value or value in path.parents for value in assignments):
+            if root_download or any(
+                path == value or value in path.parents for value in assignments
+            ):
                 result.append(item)
         return result
 
     def active_scope(scope_id: str | None = None) -> dict[str, Any]:
-        scope = (
-            store.get_selection_scope(scope_id)
-            if scope_id
-            else store.latest_selection_scope()
-        )
+        scope = store.get_selection_scope(scope_id) if scope_id else store.latest_selection_scope()
         if scope is None or scope["status"] != "active":
             raise PermissionError("A current desktop-created selection scope is required")
         return scope
@@ -153,25 +163,88 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
             "facts": json.loads(encoded),
         }
 
+    cloud_policy_rank = {
+        CloudPolicy.NONE: 0,
+        CloudPolicy.LOCAL_ONLY: 0,
+        CloudPolicy.METADATA_ONLY: 1,
+        CloudPolicy.CLOUD_TEXT: 2,
+        CloudPolicy.TEXT_AND_IMAGES: 3,
+        CloudPolicy.INHERIT: 0,
+    }
+
+    mcp_processing_is_local = (
+        os.getenv("AIORGANIZER_MCP_PROCESSING_LOCALITY", "cloud").casefold() == "local"
+    )
+
+    def effective_root_policy(root: dict[str, Any]) -> CloudPolicy:
+        effective = CloudPolicy(root.get("cloud_policy", CloudPolicy.NONE.value))
+        if effective == CloudPolicy.INHERIT:
+            categories = {value["id"]: value for value in store.list_category_payloads()}
+            inherited = [
+                CloudPolicy(category.get("cloud_policy", CloudPolicy.INHERIT.value))
+                for category_id in root.get("category_ids", [])
+                if (category := categories.get(category_id))
+                and CloudPolicy(category.get("cloud_policy", CloudPolicy.INHERIT.value))
+                != CloudPolicy.INHERIT
+            ]
+            effective = min(inherited, key=cloud_policy_rank.get) if inherited else CloudPolicy.NONE
+        return effective
+
+    def require_mcp_root_policy(root_id: str, required: CloudPolicy) -> None:
+        if mcp_processing_is_local:
+            return
+        root = next(
+            (value for value in store.list_source_payloads() if value["id"] == root_id),
+            None,
+        )
+        if root is None:
+            raise ValueError("Inventory source is unavailable")
+        effective = effective_root_policy(root)
+        if cloud_policy_rank[effective] < cloud_policy_rank[required]:
+            raise PermissionError(
+                f"Source policy {effective.value} blocks this MCP content request"
+            )
+
+    def allowed_mcp_roots(required: CloudPolicy) -> set[str]:
+        roots = store.list_source_payloads()
+        if mcp_processing_is_local:
+            return {str(value["id"]) for value in roots}
+        return {
+            str(value["id"])
+            for value in roots
+            if cloud_policy_rank[effective_root_policy(value)] >= cloud_policy_rank[required]
+        }
+
+    def scoped_mcp_roots(
+        requested: list[str] | None, required: CloudPolicy = CloudPolicy.METADATA_ONLY
+    ) -> set[str]:
+        allowed = allowed_mcp_roots(required)
+        selected = set(requested or ())
+        blocked = selected - allowed
+        if blocked:
+            raise PermissionError("One or more source policies block this MCP metadata request")
+        return selected or allowed
+
+    def require_mcp_content_policy(item_id: str, required: CloudPolicy) -> None:
+        item = next((value for value in store.list_items() if value["id"] == item_id), None)
+        if item is None:
+            raise ValueError("Unknown inventory item")
+        require_mcp_root_policy(str(item["root_id"]), required)
+
     def validated_item_path(item_id: str) -> tuple[dict[str, Any], Path]:
         item = next((value for value in store.list_items() if value["id"] == item_id), None)
         if item is None:
             raise ValueError("Unknown inventory item identifier")
         source = next(
-            (
-                value
-                for value in store.list_source_payloads()
-                if value["id"] == item["root_id"]
-            ),
+            (value for value in store.list_source_payloads() if value["id"] == item["root_id"]),
             None,
         )
         if source is None:
             raise ValueError("Source root is unavailable")
         path = Path(str(source["path"])) / str(item["relative_path"])
         stat = path.stat()
-        if (
-            stat.st_size != int(item.get("size", 0))
-            or stat.st_mtime_ns != int(item.get("modified_ns", 0))
+        if stat.st_size != int(item.get("size", 0)) or stat.st_mtime_ns != int(
+            item.get("modified_ns", 0)
         ):
             raise RuntimeError("File changed since inventory; revalidate before content access")
         return item, path
@@ -311,9 +384,7 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
         digest = request_digest(
             {"selection_scope_id": selection_scope_id, "suggestions": suggestions}
         )
-        cached = store.idempotent_response(
-            "category_suggest_assignments", idempotency_key, digest
-        )
+        cached = store.idempotent_response("category_suggest_assignments", idempotency_key, digest)
         if cached is not None:
             return cached
         store.activity(
@@ -369,12 +440,43 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
     @server.tool()
     def inventory_list_roots() -> dict[str, Any]:
         """List opaque source roots and inventory counts without exposing absolute paths."""
-        return {"roots": inventory_query().list_roots()}
+        return {"roots": inventory_query(allowed_mcp_roots(CloudPolicy.METADATA_ONLY)).list_roots()}
+
+    @server.tool()
+    def storage_list_volumes() -> dict[str, Any]:
+        """List mounted volumes, capacity/free space, type, and configured-source coverage."""
+        if not mcp_processing_is_local:
+            raise PermissionError(
+                "Storage discovery is available only to explicitly local MCP processing"
+            )
+        return inventory_query().storage_volumes()
+
+    @server.tool()
+    def storage_list_directory(
+        volume_id: str,
+        relative_path: str = "",
+        include_hidden: bool = False,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """List bounded names/stat metadata under a volume; never read file content."""
+        if not mcp_processing_is_local:
+            raise PermissionError(
+                "Unconfigured storage browsing is available only to explicitly local MCP processing"
+            )
+        return inventory_query().storage_list_directory(
+            volume_id,
+            relative_path,
+            include_hidden=include_hidden,
+            offset=offset,
+            limit=limit,
+        )
 
     @server.tool()
     def inventory_list_items(offset: int = 0, limit: int = 100) -> dict[str, Any]:
         """List bounded inventory records; prefer inventory_search for discovery."""
-        return inventory_query().search("**", offset=offset, limit=limit)
+        roots = allowed_mcp_roots(CloudPolicy.METADATA_ONLY)
+        return inventory_query(roots).search("**", root_ids=roots, offset=offset, limit=limit)
 
     @server.tool()
     def inventory_search(
@@ -392,10 +494,11 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
         """Search cached inventory with *, **, extension, type, size, and timestamp filters."""
         if item_type not in {"any", "file", "folder"}:
             raise ValueError("item_type must be any, file, or folder")
-        return inventory_query().search(
+        roots = scoped_mcp_roots(root_ids)
+        return inventory_query(roots).search(
             glob,
             extensions=extensions or (),
-            root_ids=set(root_ids or ()) or None,
+            root_ids=roots,
             item_type=item_type,  # type: ignore[arg-type]
             min_size=min_size,
             max_size=max_size,
@@ -408,7 +511,26 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
     @server.tool()
     def inventory_summary(glob: str = "**", root_ids: list[str] | None = None) -> dict[str, Any]:
         """Summarize counts by extension/MIME, size, timestamps, folders, and cache freshness."""
-        return inventory_query().summary(glob, set(root_ids or ()) or None)
+        roots = scoped_mcp_roots(root_ids)
+        return inventory_query(roots).summary(glob, roots)
+
+    @server.tool()
+    def inventory_list_file_issues(
+        root_ids: list[str] | None = None,
+        severity: str | None = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """List bounded parser/file-health diagnostics; warnings are not corruption claims."""
+        if severity not in {None, "warning", "error"}:
+            raise ValueError("severity must be warning or error")
+        roots = scoped_mcp_roots(root_ids)
+        return inventory_query(roots).list_file_issues(
+            root_ids=roots,
+            severity=severity,
+            offset=offset,
+            limit=limit,
+        )
 
     @server.tool()
     def inventory_list_children(
@@ -418,7 +540,8 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
         limit: int = 100,
     ) -> dict[str, Any]:
         """List direct children of a source root or opaque folder item identifier."""
-        return inventory_query().list_children(
+        require_mcp_root_policy(root_id, CloudPolicy.METADATA_ONLY)
+        return inventory_query({root_id}).list_children(
             root_id=root_id,
             parent_item_id=parent_item_id,
             offset=offset,
@@ -428,18 +551,24 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
     @server.tool()
     def inventory_get_item(item_id: str) -> dict[str, Any]:
         """Read one inventory record by opaque identifier, never by caller-supplied path."""
-        return inventory_query().get_item(item_id)
+        item = next((value for value in store.list_items() if value["id"] == item_id), None)
+        if item is None:
+            raise ValueError("Unknown inventory item")
+        root_id = str(item["root_id"])
+        require_mcp_root_policy(root_id, CloudPolicy.METADATA_ONLY)
+        return inventory_query({root_id}).get_item(item_id)
 
     @server.tool()
     def inventory_folder_tree(
         root_ids: list[str] | None = None,
-        max_depth: int = 6,
+        max_depth: int = 0,
         offset: int = 0,
         limit: int = 250,
     ) -> dict[str, Any]:
         """Return the current bounded folder hierarchy with parent, depth, and child counts."""
-        return inventory_query().folder_tree(
-            root_ids=set(root_ids or ()) or None,
+        roots = scoped_mcp_roots(root_ids)
+        return inventory_query(roots).folder_tree(
+            root_ids=roots,
             max_depth=max_depth,
             offset=offset,
             limit=limit,
@@ -450,11 +579,15 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
         """Return approved semantic categories, facet tags, roles, and folder-depth policy."""
         raw_depth = store.get_meta("folder_depth_policy")
         try:
-            depth = json.loads(raw_depth) if raw_depth else {
-                "preferred_depth": 2,
-                "maximum_depth": 3,
-                "adaptive": True,
-            }
+            depth = (
+                json.loads(raw_depth)
+                if raw_depth
+                else {
+                    "preferred_depth": 2,
+                    "maximum_depth": 3,
+                    "adaptive": True,
+                }
+            )
         except json.JSONDecodeError:
             depth = {"preferred_depth": 2, "maximum_depth": 3, "adaptive": True}
         return {
@@ -555,9 +688,7 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
         }
 
     @server.tool()
-    def email_list_account_security_evidence(
-        offset: int = 0, limit: int = 100
-    ) -> dict[str, Any]:
+    def email_list_account_security_evidence(offset: int = 0, limit: int = 100) -> dict[str, Any]:
         """List derived account/security evidence with no bodies, reset links, tokens, or codes."""
         account = next((value for value in store.list_email_accounts() if value["active"]), None)
         values = store.list_account_security_evidence(str(account["id"])) if account else []
@@ -594,6 +725,7 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
         item = next((value for value in store.list_items() if value["id"] == item_id), None)
         if item is None:
             raise ValueError("Unknown inventory item identifier")
+        require_mcp_root_policy(str(item["root_id"]), CloudPolicy.METADATA_ONLY)
         if not item.get("metadata", {}).get("archive_format"):
             raise ValueError("Inventory item has no indexed archive member list")
         return store.list_archive_members(
@@ -617,9 +749,9 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
     ) -> dict[str, Any]:
         """Read redacted structured evidence summaries only within a desktop-created scope."""
         scope = active_scope(selection_scope_id)
-        result = store.list_evidence_payloads(
-            set(scope["item_ids"]), offset=offset, limit=limit
-        )
+        for item_id in scope["item_ids"]:
+            require_mcp_content_policy(str(item_id), CloudPolicy.CLOUD_TEXT)
+        result = store.list_evidence_payloads(set(scope["item_ids"]), offset=offset, limit=limit)
         result["evidence"] = [safe_evidence_summary(value) for value in result["evidence"]]
         result["selection_scope_id"] = selection_scope_id
         return result
@@ -684,6 +816,7 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
         scope = active_scope(selection_scope_id)
         if item_id not in set(scope["item_ids"]):
             raise PermissionError("Evidence request escapes the active selection scope")
+        require_mcp_content_policy(item_id, CloudPolicy.CLOUD_TEXT)
         validated_item_path(item_id)
         records = store.list_evidence_payloads({item_id}, limit=250)["evidence"]
         pages: list[str] = []
@@ -725,6 +858,7 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
         scope = active_scope(selection_scope_id)
         if item_id not in set(scope["item_ids"]):
             raise PermissionError("Image request escapes the active selection scope")
+        require_mcp_content_policy(item_id, CloudPolicy.TEXT_AND_IMAGES)
         item, path = validated_item_path(item_id)
         if str(item.get("extension", "")).casefold() != ".pdf":
             raise ValueError("Scoped item is not a PDF")
@@ -853,9 +987,7 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
         }
         requests = {
             record["entity_key"]: record
-            for record in store.list_semantic_records(
-                "software", "update_research_request"
-            )
+            for record in store.list_semantic_records("software", "update_research_request")
             if record.get("status") == "current"
         }
         targets = []
@@ -905,9 +1037,7 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
         }
         requests = {
             record["entity_key"]: record
-            for record in store.list_semantic_records(
-                "download", "update_research_request"
-            )
+            for record in store.list_semantic_records("download", "update_research_request")
             if record.get("status") == "current"
         }
         start = max(0, offset)
@@ -1237,9 +1367,7 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
             raise ValueError("An idempotency key is required")
         scope = active_scope(selection_scope_id)
         proposal_kind = ProposalKind(kind)
-        digest = request_digest(
-            {"selection_scope_id": selection_scope_id, "kind": kind}
-        )
+        digest = request_digest({"selection_scope_id": selection_scope_id, "kind": kind})
         cached = store.idempotent_response("proposal_create_set", idempotency_key, digest)
         if cached is not None:
             return cached
@@ -1269,9 +1397,7 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
             "accepted": False,
             "committed": False,
         }
-        store.save_idempotent_response(
-            "proposal_create_set", idempotency_key, digest, response
-        )
+        store.save_idempotent_response("proposal_create_set", idempotency_key, digest, response)
         store.record_mcp_audit(
             "proposal_create_set",
             idempotency_key,
@@ -1479,9 +1605,7 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
         if len(rationales) > 250:
             raise ValueError("Batch exceeds 250 rationale changes")
         rationale_map = {
-            str(value.get("item_id", "")): redact_sensitive(
-                str(value.get("rationale", ""))
-            )[:2_000]
+            str(value.get("item_id", "")): redact_sensitive(str(value.get("rationale", "")))[:2_000]
             for value in rationales
         }
 
@@ -1577,9 +1701,7 @@ def build_server(workspace_path: Path):  # type: ignore[no-untyped-def]
                 "selection_scope_id": selection_scope_id,
             }
         )
-        cached = store.idempotent_response(
-            "proposal_request_user_review", idempotency_key, digest
-        )
+        cached = store.idempotent_response("proposal_request_user_review", idempotency_key, digest)
         if cached is not None:
             return cached
         store.activity("mcp.review_requested", f"Review requested for {proposal_set_id}")

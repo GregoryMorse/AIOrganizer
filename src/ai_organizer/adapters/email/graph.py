@@ -69,7 +69,9 @@ class UrllibGraphTransport:
         url = _graph_url(url_or_path)
         segments = {segment.casefold() for segment in urlparse(url).path.split("/") if segment}
         if segments.intersection(_BLOCKED_SEGMENTS):
-            raise ValueError("Sending, replying, forwarding, and permanent deletion are out of scope")
+            raise ValueError(
+                "Sending, replying, forwarding, and permanent deletion are out of scope"
+            )
         request_headers = {
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
@@ -104,7 +106,11 @@ class GraphClient:
             "$select=id,displayName,parentFolderId,childFolderCount,totalItemCount,unreadItemCount"
         )
         values, _ = self._paged(token, path, max_items=max_items)
-        pending = [str(value["id"]) for value in values if value.get("id") and value.get("childFolderCount")]
+        pending = [
+            str(value["id"])
+            for value in values
+            if value.get("id") and value.get("childFolderCount")
+        ]
         visited = {str(value.get("id", "")) for value in values}
         while pending and len(values) < max_items:
             parent = pending.pop(0)
@@ -148,6 +154,7 @@ class GraphClient:
         path = delta_link or (
             f"/me/mailFolders/{quote(folder_id, safe='')}/messages/delta?"
             "$select=id,parentFolderId,subject,from,receivedDateTime,bodyPreview,"
+            "sentDateTime,toRecipients,ccRecipients,importance,flag,"
             "internetMessageId,conversationId,hasAttachments,isRead,changeKey,categories"
         )
         values, final_delta = self._paged(
@@ -177,9 +184,24 @@ class GraphClient:
                     str(value.get("@odata.etag", "")),
                     tuple(str(item)[:255] for item in value.get("categories", [])),
                     "@removed" in value,
+                    to_recipients=self._recipient_addresses(value.get("toRecipients", [])),
+                    cc_recipients=self._recipient_addresses(value.get("ccRecipients", [])),
+                    sent_at=str(value.get("sentDateTime", "")),
+                    importance=str(value.get("importance", "normal"))[:40],
+                    flag_status=str(value.get("flag", {}).get("flagStatus", "notFlagged"))[:40],
                 )
             )
         return messages, final_delta
+
+    @staticmethod
+    def _recipient_addresses(values: Any) -> tuple[str, ...]:
+        if not isinstance(values, list):
+            return ()
+        return tuple(
+            str(value.get("emailAddress", {}).get("address", ""))[:320]
+            for value in values[:100]
+            if isinstance(value, dict) and value.get("emailAddress", {}).get("address")
+        )
 
     def list_attachment_metadata(
         self,
@@ -207,21 +229,70 @@ class GraphClient:
             if value.get("id")
         ]
 
-    def create_folder(
-        self, token: str, parent_folder_id: str, display_name: str
-    ) -> dict[str, Any]:
+    def create_folder(self, token: str, parent_folder_id: str, display_name: str) -> dict[str, Any]:
         existing, _ = self._paged(
             token,
             f"/me/mailFolders/{quote(parent_folder_id, safe='')}/childFolders?"
             "$select=id,displayName",
             max_items=500,
         )
-        if any(str(value.get("displayName", "")).casefold() == display_name.casefold() for value in existing):
+        if any(
+            str(value.get("displayName", "")).casefold() == display_name.casefold()
+            for value in existing
+        ):
             raise RemoteConflict("A folder with this name now exists under the proposed parent")
         return self._post(
             token,
             f"/me/mailFolders/{quote(parent_folder_id, safe='')}/childFolders",
             {"displayName": display_name},
+        )
+
+    def rename_folder(
+        self,
+        token: str,
+        folder_id: str,
+        display_name: str,
+        *,
+        expected_display_name: str,
+        expected_parent_folder_id: str,
+        expected_etag: str = "",
+    ) -> dict[str, Any]:
+        current = self._get(
+            token,
+            f"/me/mailFolders/{quote(folder_id, safe='')}?$select=id,displayName,parentFolderId",
+        )
+        _validate_folder_state(current, expected_display_name, expected_parent_folder_id)
+        headers = {"If-Match": expected_etag} if expected_etag else None
+        response = self.transport.request(
+            "PATCH",
+            f"/me/mailFolders/{quote(folder_id, safe='')}",
+            token,
+            json_body={"displayName": display_name},
+            headers=headers,
+        )
+        return response.payload
+
+    def move_folder(
+        self,
+        token: str,
+        folder_id: str,
+        destination_folder_id: str,
+        *,
+        expected_display_name: str,
+        expected_parent_folder_id: str,
+        expected_etag: str = "",
+    ) -> dict[str, Any]:
+        current = self._get(
+            token,
+            f"/me/mailFolders/{quote(folder_id, safe='')}?$select=id,displayName,parentFolderId",
+        )
+        _validate_folder_state(current, expected_display_name, expected_parent_folder_id)
+        headers = {"If-Match": expected_etag} if expected_etag else None
+        return self._post(
+            token,
+            f"/me/mailFolders/{quote(folder_id, safe='')}/move",
+            {"destinationId": destination_folder_id},
+            headers=headers,
         )
 
     def move_message(
@@ -236,8 +307,7 @@ class GraphClient:
     ) -> dict[str, Any]:
         current = self._get(
             token,
-            f"/me/messages/{quote(message_id, safe='')}?"
-            "$select=id,parentFolderId,changeKey",
+            f"/me/messages/{quote(message_id, safe='')}?$select=id,parentFolderId,changeKey",
         )
         if str(current.get("parentFolderId", "")) != expected_folder_id:
             raise RemoteConflict("Message moved since the proposal was created")
@@ -332,6 +402,15 @@ class GraphClient:
             delta_link = str(response.payload.get("@odata.deltaLink", delta_link))
             next_path = str(response.payload.get("@odata.nextLink", ""))
         return values[:max_items], delta_link
+
+
+def _validate_folder_state(
+    current: dict[str, Any], expected_display_name: str, expected_parent_folder_id: str
+) -> None:
+    if str(current.get("displayName", "")) != expected_display_name:
+        raise RemoteConflict("Mail folder was renamed since the proposal was created")
+    if str(current.get("parentFolderId", "")) != expected_parent_folder_id:
+        raise RemoteConflict("Mail folder was moved since the proposal was created")
 
 
 def _graph_url(url_or_path: str) -> str:

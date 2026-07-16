@@ -46,9 +46,7 @@ class _PageParser(HTMLParser):
 
     def text(self) -> str:
         return "\n".join(
-            line.strip()
-            for line in " ".join(self.parts).splitlines()
-            if line.strip()
+            line.strip() for line in " ".join(self.parts).splitlines() if line.strip()
         )[:MAX_PAGE_TEXT]
 
 
@@ -140,10 +138,11 @@ class PublicWebResearchClient:
             final_url = str(response.geturl())
             _validate_public_https(final_url)
             content_type = str(response.headers.get_content_type()).casefold()
-            allowed = (
-                content_type.startswith("text/")
-                or content_type in {"application/json", "application/xml", "application/rss+xml"}
-            )
+            allowed = content_type.startswith("text/") or content_type in {
+                "application/json",
+                "application/xml",
+                "application/rss+xml",
+            }
             if not allowed:
                 raise ValueError(f"Update research cannot parse content type {content_type}")
             return response.read(MAX_PAGE_BYTES), final_url, content_type
@@ -155,7 +154,9 @@ def _validate_public_https(url: str) -> None:
     try:
         addresses = {
             item[4][0]
-            for item in socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+            for item in socket.getaddrinfo(
+                parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM
+            )
         }
     except OSError as error:
         raise ValueError("Update research hostname could not be resolved") from error

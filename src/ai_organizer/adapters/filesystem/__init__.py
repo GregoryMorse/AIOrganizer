@@ -1,6 +1,11 @@
 from .cleanup import CleanupAnalyzer
 from .inventory import DiscoveryProgress, FileSystemInventory, ScanCancelled
-from .metadata import MetadataIndexer, content_fingerprint, metadata_fingerprint
+from .metadata import (
+    MetadataIndexer,
+    content_fingerprint,
+    metadata_cache_compatible,
+    metadata_fingerprint,
+)
 from .operations import (
     CleanupRequest,
     FileOperationEngine,
@@ -27,5 +32,6 @@ __all__ = [
     "SnapshotToken",
     "content_fingerprint",
     "journal_to_dict",
+    "metadata_cache_compatible",
     "metadata_fingerprint",
 ]

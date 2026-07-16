@@ -120,9 +120,64 @@ def test_assigning_source_root_policy_updates_parent_and_inherited_children(
         FolderRole.DESTINATION,
     }
     payload = next(
-        value
-        for value in controller.store.list_source_payloads()
-        if value["id"] == source.id
+        value for value in controller.store.list_source_payloads() if value["id"] == source.id
     )
     assert set(payload["roles"]) == {"inbox", "downloads", "destination"}
+    controller.close()
+
+
+def test_new_source_is_minimal_until_classification_is_approved(tmp_path: Path) -> None:
+    root = tmp_path / "unclassified"
+    root.mkdir()
+    controller = WorkspaceController()
+    controller.create_workspace(tmp_path / "minimal.aioworkspace", "Minimal")
+
+    source = controller.add_source(root)
+
+    assert source.roles == set()
+    assert source.category_ids == set()
+    assert source.tag_ids == set()
+    assert not controller.source_is_classified(source.id)
+    assert not controller.source_is_operational(source.id)
+
+    assert controller.store is not None
+    category_id = str(controller.store.list_category_payloads()[0]["id"])
+    tag_id = str(controller.store.list_tag_definition_payloads()[0]["id"])
+    controller.set_source_classification(
+        source.id,
+        {category_id},
+        {tag_id},
+        {FolderRole.ARCHIVE},
+    )
+
+    assert controller.source_is_classified(source.id)
+    assert controller.source_is_operational(source.id)
+    assert source.category_ids == {category_id}
+    assert source.tag_ids == {tag_id}
+    assert source.roles == {FolderRole.ARCHIVE}
+    controller.close()
+
+
+def test_excluded_source_is_classified_but_not_operational(tmp_path: Path) -> None:
+    root = tmp_path / "excluded"
+    root.mkdir()
+    controller = WorkspaceController()
+    controller.create_workspace(tmp_path / "excluded.aioworkspace", "Excluded")
+
+    source = controller.add_source(root, roles={FolderRole.EXCLUDED})
+
+    assert controller.source_is_classified(source.id)
+    assert not controller.source_is_operational(source.id)
+    controller.close()
+
+
+def test_legacy_source_depth_override_does_not_limit_folder_plan_policy(tmp_path: Path) -> None:
+    root = tmp_path / "legacy-depth"
+    root.mkdir()
+    controller = WorkspaceController()
+    controller.create_workspace(tmp_path / "depth.aioworkspace", "Depth")
+
+    source = controller.add_source(root, max_hierarchy_depth=1)
+
+    assert controller.folder_depth_limit(source.id) == 3
     controller.close()

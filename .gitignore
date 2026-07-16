@@ -21,6 +21,7 @@ artifacts/
 *.aioworkspace-wal
 *.aioworkspace.backup-*
 .aiorganizer-cache/
+.internal/
 synthetic-corpus/
 *.log
 nuitka-crash-report.xml

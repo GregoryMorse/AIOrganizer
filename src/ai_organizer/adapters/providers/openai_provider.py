@@ -25,6 +25,7 @@ class OpenAIProvider:
             response = self._client.responses.create(
                 model=prompt.model or self.model,
                 input=redact(prompt.text),
+                store=False,
                 text={
                     "format": {
                         "type": "json_schema",

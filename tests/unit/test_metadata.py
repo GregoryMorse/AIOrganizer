@@ -1,14 +1,68 @@
 from __future__ import annotations
 
+import logging
 import platform
 import sqlite3
 import sys
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from ai_organizer.adapters.filesystem import FileSystemInventory, MetadataIndexer
-from ai_organizer.adapters.filesystem.metadata import _executable_metadata
+from ai_organizer.adapters.filesystem.metadata import (
+    _executable_metadata,
+    metadata_cache_compatible,
+)
 from ai_organizer.adapters.persistence import WorkspaceStore
+
+
+def test_pdf_parser_warnings_become_bounded_file_health_metadata(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    class Reader:
+        def __init__(self, path: Path, strict: bool = False) -> None:
+            assert strict is False
+            self.is_encrypted = False
+            self.pages = [object()]
+            self.metadata = {"/Title": "Recoverable"}
+            logging.getLogger("pypdf._reader").warning("invalid pdf header: b' %%PDF'")
+            logging.getLogger("pypdf._reader").warning(
+                "Ignoring wrong pointing object 38 0 (offset 0)"
+            )
+
+    monkeypatch.setitem(sys.modules, "pypdf", SimpleNamespace(PdfReader=Reader))
+    root = tmp_path / "root"
+    root.mkdir()
+    path = root / "recoverable.pdf"
+    path.write_bytes(b"not read by fake parser")
+    item = FileSystemInventory().scan("root", root, [])[0]
+
+    metadata = MetadataIndexer().extract(path, item)
+
+    assert metadata["file_health_status"] == "warning"
+    assert metadata["file_health_issue_count"] == 2
+    assert {value["code"] for value in metadata["file_health_issues"]} == {
+        "pdf_nonstandard_header",
+        "pdf_broken_object_reference",
+    }
+    assert capsys.readouterr().err == ""
+
+
+def test_legacy_pdf_cache_refreshes_once_for_file_health_contract(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    path = root / "legacy.pdf"
+    path.write_bytes(b"legacy")
+    item = FileSystemInventory().scan("root", root, [])[0]
+
+    assert metadata_cache_compatible(item, {"page_count": 1}) is False
+    assert (
+        metadata_cache_compatible(
+            item,
+            {"page_count": 1, "file_health_status": "no_issues_observed"},
+        )
+        is True
+    )
 
 
 def test_text_metadata_is_cached_by_filesystem_fingerprint(tmp_path: Path) -> None:
@@ -77,9 +131,7 @@ def test_cache_age_does_not_expire_unchanged_metadata(tmp_path: Path) -> None:
     item = FileSystemInventory().scan("root", root, [])[0]
     store = WorkspaceStore.create(tmp_path / "durable.aioworkspace", "Durable")
     store.save_cached_metadata(item, {"marker": "preserved"})
-    store.connection.execute(
-        "UPDATE metadata_cache SET updated_at='2000-01-01T00:00:00+00:00'"
-    )
+    store.connection.execute("UPDATE metadata_cache SET updated_at='2000-01-01T00:00:00+00:00'")
     store.connection.commit()
 
     cached = store.cached_metadata(item)
@@ -87,9 +139,7 @@ def test_cache_age_does_not_expire_unchanged_metadata(tmp_path: Path) -> None:
     assert cached is not None
     assert cached["marker"] == "preserved"
     assert cached["_cache"]["validated_by"] == "size+modified_ns"
-    columns = {
-        row["name"] for row in store.connection.execute("PRAGMA table_info(metadata_cache)")
-    }
+    columns = {row["name"] for row in store.connection.execute("PRAGMA table_info(metadata_cache)")}
     assert "expires_at" not in columns
     store.close()
 
@@ -116,11 +166,11 @@ def test_legacy_ttl_column_is_removed_without_losing_metadata(tmp_path: Path) ->
 
     store = WorkspaceStore(workspace)
 
-    columns = {
-        row["name"] for row in store.connection.execute("PRAGMA table_info(metadata_cache)")
-    }
+    columns = {row["name"] for row in store.connection.execute("PRAGMA table_info(metadata_cache)")}
     assert "expires_at" not in columns
-    assert store.metadata_cache_records()[("root", "document.txt")]["payload"]["marker"] == "preserved"
+    assert (
+        store.metadata_cache_records()[("root", "document.txt")]["payload"]["marker"] == "preserved"
+    )
     store.close()
 
 

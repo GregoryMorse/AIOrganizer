@@ -25,7 +25,17 @@ from ai_organizer.domain.prompts import (
 
 SUGGESTIONS = {
     "audit": ["Prefer repeated patterns", "Explain counterexamples", "Avoid brittle rules"],
+    "sources": [
+        "Prefer a small set of clearly scoped sources",
+        "Consider volume capacity and source overlap",
+        "Never add or broaden a source without review",
+    ],
     "rename": ["Prefer document dates", "Omit redundant folder context", "Preserve entity names"],
+    "repair": [
+        "Correct OCR without inventing text",
+        "Preserve redaction placeholders exactly",
+        "Prefer visually lossless compression",
+    ],
     "folder": ["Keep hierarchy at most 3 levels", "Group recurring documents by year"],
     "move": ["Prefer existing destinations", "Separate archives from active material"],
     "action": ["Route uncertainty to review", "Explain sensitive classifications"],
@@ -35,9 +45,45 @@ SUGGESTIONS = {
         "Clean only detected project roots",
     ],
     "updates": [
-        "Prefer official human-readable release pages",
+        "Track downloaded software archives, papers, and recurring publications",
+        "Prefer official human-readable release or publication pages",
         "Preserve reusable version and changelog locators",
         "Revalidate saved hints before starting a fresh search",
+    ],
+    "system_apps": [
+        "Treat installed application inventory as read-only evidence",
+        "Prefer vendor and Windows package sources",
+        "Separate assessment from update installation",
+    ],
+    "system_drivers": [
+        "Prefer signed driver and Windows Update evidence",
+        "Flag unsigned or unhealthy devices for review",
+        "Never install a driver without a separate reviewed action",
+    ],
+    "system_os_updates": [
+        "Separate security, quality, feature, and optional updates",
+        "Surface reboot requirements before any future apply step",
+        "Use Windows Update Agent results as local evidence",
+    ],
+    "system_health": [
+        "Surface degraded storage health prominently",
+        "Keep analysis read-only until a separate repair step is reviewed",
+        "Explain when SMART or fragmentation evidence is unavailable",
+    ],
+    "mail_folder": [
+        "Prefer a shallow stable mailbox hierarchy",
+        "Preserve well-known Outlook folders",
+        "Separate folder changes from rule creation",
+    ],
+    "mail_rule": [
+        "Require historical sample messages",
+        "Prefer narrow sender and subject conditions",
+        "Never forward, delete, or silently mark messages read",
+    ],
+    "mail_action": [
+        "Treat reminders as review candidates, not facts",
+        "Surface registration and security evidence",
+        "Do not claim an attachment is unsaved without a save record",
     ],
 }
 
@@ -71,11 +117,6 @@ class GuidanceContextBar(QWidget):
         self._loading_context = False
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 4)
-        layout.addWidget(QLabel("Work with"))
-        self.content_kind = QComboBox()
-        self.content_kind.addItems(["Files & folders", "Email"])
-        self.content_kind.setToolTip("One content system per proposal set")
-        layout.addWidget(self.content_kind)
         layout.addWidget(QLabel("AI context"))
         self.provider = QComboBox()
         self.provider.addItems(list(_MODELS))
@@ -117,9 +158,7 @@ class GuidanceContextBar(QWidget):
 
     def _context_changed(self) -> None:
         if self._save_context and not self._loading_context:
-            self._save_context(
-                self.view_key, self.provider.currentText(), self.model.currentText()
-            )
+            self._save_context(self.view_key, self.provider.currentText(), self.model.currentText())
 
     def refresh_context(self) -> None:
         if not self._load_context:
@@ -224,9 +263,7 @@ class GuidancePanel(QGroupBox):
         revision = PromptRevision(f"view:{self.view_key}", PromptLayerKind.VIEW, text)
         self._save_revision(revision)
         if self._save_context:
-            self._save_context(
-                self.view_key, self.provider.currentText(), self.model.currentText()
-            )
+            self._save_context(self.view_key, self.provider.currentText(), self.model.currentText())
         self.history.insertItem(0, f"{revision.created_at} — {revision.id}", revision.text)
         self.revision_saved.emit(revision.id)
         self.show_preview()

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
     QInputDialog,
@@ -23,6 +23,7 @@ from .pages import (
     ActivityPage,
     AuditPage,
     CleanupPage,
+    DocumentRepairPage,
     EmailPage,
     FocusedActionsPage,
     FolderPlanPage,
@@ -33,6 +34,7 @@ from .pages import (
     RenamePage,
     SettingsPage,
     SourcesCategoriesPage,
+    SystemPage,
     UpdatesPage,
 )
 
@@ -46,16 +48,18 @@ class MainWindow(QMainWindow):
         self.controller = WorkspaceController()
         self.settings = QSettings("AIOrganizer", "AIOrganizer")
         self.navigation = QListWidget()
+        self.navigation.setObjectName("navigationList")
         self.navigation.setFixedWidth(210)
         self.navigation.setAccessibleName("Application sections")
         self.navigation.setToolTip("Use Up and Down arrows to move between application sections")
         self.stack = QStackedWidget()
-        pages = [
+        self.file_pages = [
             ("Overview", OverviewPage(self.controller), True),
             ("Sources & Categories", SourcesCategoriesPage(self.controller), True),
             ("Inventory", InventoryPage(self.controller), True),
             ("Audit", AuditPage(self.controller), True),
             ("Updates", UpdatesPage(self.controller), True),
+            ("Document Repair", DocumentRepairPage(self.controller), True),
             ("Rename", RenamePage(self.controller), True),
             ("Folder Plan", FolderPlanPage(self.controller), True),
             ("Move", MovePage(self.controller), True),
@@ -64,36 +68,55 @@ class MainWindow(QMainWindow):
             ("Focused Actions", FocusedActionsPage(self.controller), True),
             ("Activity", ActivityPage(self.controller), True),
             ("Settings", SettingsPage(self.controller), True),
-            ("Email", EmailPage(self.controller), True),
         ]
-        for label, page, enabled in pages:
-            item = QListWidgetItem(label)
-            item.setFlags(item.flags() if enabled else item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
-            self.navigation.addItem(item)
+        self.email_page = EmailPage(self.controller)
+        self.mail_settings_page = SettingsPage(self.controller, mode="mail")
+        self.mail_pages = [
+            ("Folder Proposals", self.email_page, 0),
+            ("Rule Proposals", self.email_page, 1),
+            ("Focused Actions", self.email_page, 2),
+            ("Settings", self.mail_settings_page, None),
+        ]
+        self.system_page = SystemPage(self.controller)
+        self.system_application_page = UpdatesPage(self.controller, content_scope="software")
+        self.system_settings_page = SettingsPage(self.controller, mode="system")
+        self.system_pages = [
+            ("Applications", self.system_application_page, None),
+            ("Drivers", self.system_page, 1),
+            ("Windows Update", self.system_page, 2),
+            ("Health", self.system_page, 3),
+            ("Settings", self.system_settings_page, None),
+        ]
+        for _label, page, _enabled in self.file_pages:
             self.stack.addWidget(page)
-        self.navigation.currentRowChanged.connect(self.stack.setCurrentIndex)
-        self.navigation.setCurrentRow(0)
+        self.stack.addWidget(self.email_page)
+        self.stack.addWidget(self.mail_settings_page)
+        self.stack.addWidget(self.system_page)
+        self.stack.addWidget(self.system_application_page)
+        self.stack.addWidget(self.system_settings_page)
+        self.navigation.currentRowChanged.connect(self._navigate)
         splitter = QSplitter()
         splitter.addWidget(self.navigation)
         splitter.addWidget(self.stack)
         splitter.setStretchFactor(1, 1)
         self.setCentralWidget(splitter)
         self._create_menu()
+        self.set_mode("files")
         self.setStyleSheet(
             """
             QLabel#pageTitle { font-size: 24px; font-weight: 600; margin-bottom: 8px; }
             QLabel#safetyBanner { background: #fff4ce; color: #5c4500; padding: 12px; border-radius: 4px; }
-            QListWidget { padding: 6px; }
-            QListWidget::item { padding: 9px; }
+            QListWidget#navigationList { padding: 6px; }
+            QListWidget#navigationList::item { padding: 9px; }
+            QListWidget[compactChecklist="true"] { padding: 1px; }
+            QListWidget[compactChecklist="true"]::item { padding: 1px 4px; }
             """
         )
         if not self.settings.value(OnboardingWizard.SETTINGS_KEY, False, bool):
             from PySide6.QtWidgets import QApplication
 
             application = QApplication.instance()
-            if application is not None and not bool(
-                application.property("aiorganizerSmokeTest")
-            ):
+            if application is not None and not bool(application.property("aiorganizerSmokeTest")):
                 QTimer.singleShot(0, self.show_onboarding)
 
     def _create_menu(self) -> None:
@@ -127,6 +150,39 @@ class MainWindow(QMainWindow):
         self._refresh_recent_menu()
         file_menu.addSeparator()
         file_menu.addAction(quit_action)
+        mode_menu = self.menuBar().addMenu("&Mode")
+        self.mode_group = QActionGroup(self)
+        self.mode_group.setExclusive(True)
+        self.file_mode_action = QAction("Files && Folders", self)
+        self.file_mode_action.setCheckable(True)
+        self.file_mode_action.setData("files")
+        self.file_mode_action.setStatusTip("Work with local file and folder tools")
+        self.mail_mode_action = QAction("Mail", self)
+        self.mail_mode_action.setCheckable(True)
+        self.mail_mode_action.setData("mail")
+        self.mail_mode_action.setStatusTip(
+            "Switch the whole workspace between files/folders and mailbox tools"
+        )
+        self.system_mode_action = QAction("System", self)
+        self.system_mode_action.setCheckable(True)
+        self.system_mode_action.setData("system")
+        self.system_mode_action.setStatusTip(
+            "Assess Windows applications, drivers, updates, and system health"
+        )
+        for action in (
+            self.file_mode_action,
+            self.mail_mode_action,
+            self.system_mode_action,
+        ):
+            self.mode_group.addAction(action)
+            mode_menu.addAction(action)
+            action.toggled.connect(
+                lambda checked, selected=action: (
+                    self.set_mode(str(selected.data()))
+                    if checked and getattr(self, "current_mode", "") != selected.data()
+                    else None
+                )
+            )
         help_menu = self.menuBar().addMenu("&Help")
         welcome = QAction("Welcome and safety tour…", self)
         welcome.triggered.connect(self.show_onboarding)
@@ -135,6 +191,64 @@ class MainWindow(QMainWindow):
         about = QAction("About AIOrganizer…", self)
         about.triggered.connect(self.show_about)
         help_menu.addAction(about)
+
+    def set_mail_mode(self, enabled: bool) -> None:
+        """Compatibility wrapper for callers that previously toggled mail mode."""
+        self.set_mode("mail" if enabled else "files")
+
+    def set_mode(self, mode: str) -> None:
+        """Switch the complete navigation surface between isolated tool families."""
+        if mode not in {"files", "mail", "system"}:
+            raise ValueError("Mode must be files, mail, or system")
+        self.current_mode = mode
+        actions = {
+            "files": self.file_mode_action,
+            "mail": self.mail_mode_action,
+            "system": self.system_mode_action,
+        }
+        actions[mode].setChecked(True)
+        self.navigation.blockSignals(True)
+        self.navigation.clear()
+        if mode == "mail":
+            for label, _page, _section in self.mail_pages:
+                self.navigation.addItem(QListWidgetItem(label))
+            self.stack.setCurrentWidget(self.email_page)
+            self.email_page.set_section(0)
+        elif mode == "system":
+            for label, _page, _section in self.system_pages:
+                self.navigation.addItem(QListWidgetItem(label))
+            self.stack.setCurrentWidget(self.system_application_page)
+        else:
+            for label, _page, available in self.file_pages:
+                item = QListWidgetItem(label)
+                item.setFlags(
+                    item.flags() if available else item.flags() & ~Qt.ItemFlag.ItemIsEnabled
+                )
+                self.navigation.addItem(item)
+            self.stack.setCurrentWidget(self.file_pages[0][1])
+        self.setWindowTitle("AIOrganizer")
+        self.navigation.setCurrentRow(0)
+        self.navigation.blockSignals(False)
+
+    def _navigate(self, row: int) -> None:
+        if row < 0:
+            return
+        if self.current_mode == "mail":
+            if row < len(self.mail_pages):
+                _label, page, section = self.mail_pages[row]
+                self.stack.setCurrentWidget(page)
+                if section is not None:
+                    self.email_page.set_section(section)
+            return
+        if self.current_mode == "system":
+            if row < len(self.system_pages):
+                _label, page, section = self.system_pages[row]
+                self.stack.setCurrentWidget(page)
+                if section is not None:
+                    self.system_page.set_section(section)
+            return
+        if row < len(self.file_pages):
+            self.stack.setCurrentWidget(self.file_pages[row][1])
 
     def show_onboarding(self) -> None:
         self.onboarding = OnboardingWizard(self.settings, self)
@@ -225,6 +339,8 @@ class MainWindow(QMainWindow):
 
             handoff_id = OutlookHandoffService(self.controller.store).import_file(Path(path))
             self.controller.workspace_changed.emit()
+            self.set_mode("mail")
+            self.navigation.setCurrentRow(2)
             QMessageBox.information(
                 self,
                 "Outlook metadata imported",

@@ -84,7 +84,11 @@ class UnionHierarchyPlanner:
 
         projected_by_current: dict[str, str] = {}
         for path in current:
-            matching = [source for source in rename_sources if source == path or PurePosixPath(source) in PurePosixPath(path).parents]
+            matching = [
+                source
+                for source in rename_sources
+                if source == path or PurePosixPath(source) in PurePosixPath(path).parents
+            ]
             if matching:
                 source = max(matching, key=lambda value: len(PurePosixPath(value).parts))
                 relative = PurePosixPath(path).relative_to(PurePosixPath(source))
@@ -100,9 +104,7 @@ class UnionHierarchyPlanner:
             created_path = _normalize(change.projected_path)
             projected_keys.setdefault(_key(created_path, case_sensitive), []).append("<new>")
 
-        collisions = {
-            key: values for key, values in projected_keys.items() if len(values) > 1
-        }
+        collisions = {key: values for key, values in projected_keys.items() if len(values) > 1}
         explicit_creates = {_normalize(change.projected_path) for change in create_changes}
         future_paths = set(projected_by_current.values()) | explicit_creates
 
@@ -125,7 +127,11 @@ class UnionHierarchyPlanner:
                     source,
                     projected_value,
                     action,
-                    "blocked" if issues else "ready" if action != HierarchyAction.UNCHANGED else "aligned",
+                    "blocked"
+                    if issues
+                    else "ready"
+                    if action != HierarchyAction.UNCHANGED
+                    else "aligned",
                     len(PurePosixPath(projected_value).parts),
                     tuple(issues),
                     exact_change.category_id if exact_change else None,

@@ -91,3 +91,48 @@ def test_folder_tree_is_bounded_and_preserves_parent_depth() -> None:
     assert [value["path"] for value in result["folders"]] == ["a", "a/b"]
     assert result["folders"][1]["parent_path"] == "a"
     assert result["folders"][1]["depth"] == 2
+
+
+def test_folder_tree_has_unlimited_source_depth_by_default() -> None:
+    items = [
+        {
+            "id": f"folder-{depth}",
+            "root_id": "root",
+            "relative_path": "/".join(f"level-{value}" for value in range(1, depth + 1)),
+            "is_dir": True,
+        }
+        for depth in range(1, 16)
+    ]
+
+    result = InventoryQueryService(items).folder_tree()
+
+    assert result["max_depth"] is None
+    assert result["total"] == 15
+    assert result["folders"][-1]["depth"] == 15
+
+
+def test_file_health_is_summarized_and_queryable_without_corruption_claims() -> None:
+    items = [
+        {
+            **ITEMS[0],
+            "metadata": {
+                "file_health_status": "warning",
+                "file_health_issues": [
+                    {
+                        "code": "pdf_nonstandard_header",
+                        "severity": "warning",
+                        "message": "Recovered header",
+                    }
+                ],
+            },
+        }
+    ]
+    query = InventoryQueryService(items)
+
+    summary = query.summary()
+    issues = query.list_file_issues(severity="warning")
+
+    assert summary["by_file_health_status"] == {"warning": 1}
+    assert summary["by_file_health_issue_code"] == {"pdf_nonstandard_header": 1}
+    assert issues["total"] == 1
+    assert "not automatic proof" in issues["interpretation"]

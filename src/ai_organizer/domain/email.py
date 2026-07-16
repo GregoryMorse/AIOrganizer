@@ -14,6 +14,8 @@ RULE_WRITE_SCOPES = ("MailboxSettings.ReadWrite",)
 
 class EmailProposalKind(StrEnum):
     FOLDER_CREATE = "folder_create"
+    FOLDER_RENAME = "folder_rename"
+    FOLDER_MOVE = "folder_move"
     MESSAGE_MOVE = "message_move"
     MESSAGE_CATEGORIZE = "message_categorize"
     RULE_CREATE = "rule_create"
@@ -72,6 +74,11 @@ class MailMessageSnapshot:
     categories: tuple[str, ...] = ()
     removed: bool = False
     synced_at: str = field(default_factory=utc_now)
+    to_recipients: tuple[str, ...] = ()
+    cc_recipients: tuple[str, ...] = ()
+    sent_at: str = ""
+    importance: str = "normal"
+    flag_status: str = "notFlagged"
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +118,16 @@ class EmailProposal:
             _require_keys(self.payload, {"parent_folder_id", "display_name"})
             if not str(self.payload["display_name"]).strip():
                 raise ValueError("Folder display name is required")
+        elif self.kind == EmailProposalKind.FOLDER_RENAME:
+            _require_keys(self.payload, {"folder_id", "display_name"})
+            _require_keys(self.expected_remote, {"display_name", "parent_folder_id"})
+            if not str(self.payload["display_name"]).strip():
+                raise ValueError("Folder display name is required")
+        elif self.kind == EmailProposalKind.FOLDER_MOVE:
+            _require_keys(self.payload, {"folder_id", "destination_folder_id"})
+            _require_keys(self.expected_remote, {"display_name", "parent_folder_id"})
+            if self.payload["folder_id"] == self.payload["destination_folder_id"]:
+                raise ValueError("A mail folder cannot be moved into itself")
         elif self.kind == EmailProposalKind.MESSAGE_MOVE:
             _require_keys(self.payload, {"message_id", "destination_folder_id"})
             _require_keys(self.expected_remote, {"folder_id", "change_key"})
@@ -184,6 +201,96 @@ def sanitized_preview(value: str, limit: int = 512) -> str:
     return " ".join(cleaned.split())[:limit]
 
 
+_TASK_PATTERN = re.compile(
+    r"\b(action required|complete|deadline|due|reminder|respond|review|sign|task|todo|to-do)\b",
+    re.I,
+)
+
+
+def focused_mail_findings(
+    messages: list[dict[str, Any]],
+    attachments: list[dict[str, Any]],
+    security_evidence: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Find local review candidates without claiming that an action was forgotten."""
+    findings: list[dict[str, Any]] = []
+    message_ids = {str(value.get("id", "")) for value in messages}
+    for message in messages:
+        message_id = str(message.get("id", ""))
+        text = f"{message.get('subject', '')} {message.get('body_preview', '')}"
+        flagged = str(message.get("flag_status", "")).casefold() not in {
+            "",
+            "notflagged",
+            "complete",
+        }
+        if message_id and (flagged or _TASK_PATTERN.search(text)):
+            findings.append(
+                {
+                    "id": f"mail-focus:task:{message_id}",
+                    "kind": "forgotten_task",
+                    "message_id": message_id,
+                    "title": str(message.get("subject", "Untitled message")),
+                    "received_at": str(message.get("received_at", "")),
+                    "reason": (
+                        "The message is flagged or contains task-like wording; verify whether it "
+                        "still needs action."
+                    ),
+                    "confidence": 0.8 if flagged else 0.62,
+                }
+            )
+    for evidence in security_evidence:
+        categories = {str(value) for value in evidence.get("categories", [])}
+        if not categories.intersection(
+            {"registration", "welcome", "verification", "password_reset", "mfa"}
+        ):
+            continue
+        candidates = [
+            str(value) for value in evidence.get("message_ids", []) if str(value) in message_ids
+        ]
+        message_id = candidates[-1] if candidates else ""
+        findings.append(
+            {
+                "id": f"mail-focus:registration:{evidence.get('id', evidence.get('service_key', ''))}",
+                "kind": "registration_data",
+                "message_id": message_id,
+                "title": f"Registration/security evidence for {evidence.get('display_name', '')}",
+                "received_at": str(evidence.get("last_evidence_at", "")),
+                "reason": (
+                    "Cached sender and subject patterns may document an account registration or "
+                    "security setup."
+                ),
+                "confidence": 0.7,
+            }
+        )
+    for attachment in attachments:
+        if attachment.get("is_inline"):
+            continue
+        attachment_id = str(attachment.get("id", ""))
+        message_id = str(attachment.get("message_id", ""))
+        if not attachment_id:
+            continue
+        findings.append(
+            {
+                "id": f"mail-focus:attachment:{attachment_id}",
+                "kind": "attachment_not_recorded_as_saved",
+                "message_id": message_id,
+                "attachment_id": attachment_id,
+                "title": str(attachment.get("filename", "Attachment")),
+                "received_at": str(attachment.get("received_at", "")),
+                "reason": (
+                    "The mailbox cache contains this attachment, but AIOrganizer has no reviewed "
+                    "record that it was saved. This is a reminder candidate, not proof it is missing."
+                ),
+                "confidence": 0.55,
+            }
+        )
+    return sorted(
+        findings,
+        key=lambda value: (str(value.get("received_at", "")), str(value["id"])),
+        reverse=True,
+    )[:1_000]
+
+
 def permission_review(
     proposals: list[EmailProposal], current_scopes: tuple[str, ...]
 ) -> PermissionReview:
@@ -192,6 +299,8 @@ def permission_review(
     actions = tuple(
         {
             EmailProposalKind.FOLDER_CREATE: "Create reviewed mail folders",
+            EmailProposalKind.FOLDER_RENAME: "Rename reviewed mail folders",
+            EmailProposalKind.FOLDER_MOVE: "Move reviewed mail folders",
             EmailProposalKind.MESSAGE_MOVE: "Move individually accepted messages",
             EmailProposalKind.MESSAGE_CATEGORIZE: "Assign reviewed message categories",
             EmailProposalKind.RULE_CREATE: "Create inspected inbox rules",
@@ -213,13 +322,18 @@ def _require_keys(payload: dict[str, Any], required: set[str]) -> None:
 
 
 def _validate_rule(payload: dict[str, Any]) -> None:
-    _require_keys(payload, {"display_name", "conditions", "exceptions", "actions", "priority", "sample_message_ids"})
+    _require_keys(
+        payload,
+        {"display_name", "conditions", "exceptions", "actions", "priority", "sample_message_ids"},
+    )
     actions = payload["actions"]
     if not isinstance(actions, dict) or not actions:
         raise ValueError("A rule requires explicit actions")
     forbidden = {"delete", "permanentDelete", "forwardTo", "redirectTo", "markAsRead"}
     if forbidden.intersection(actions):
-        raise ValueError("Deleting, forwarding, redirecting, and hidden broad actions are not allowed")
+        raise ValueError(
+            "Deleting, forwarding, redirecting, and hidden broad actions are not allowed"
+        )
     allowed = {"moveToFolder", "assignCategories", "stopProcessingRules"}
     if not set(actions).issubset(allowed):
         raise ValueError("Rule contains an unsupported action")
