@@ -8,6 +8,33 @@ import sys
 from pathlib import Path
 
 
+def patch_nuitka_macos_symlink_scan(dependency_scan_file: Path) -> bool:
+    """Backport Nuitka's symlink-safe macOS dependency lookup.
+
+    Nuitka 2.8.10 compares a resolved dylib path with its collected source path
+    as strings. Homebrew's Intel runner paths can name the same OpenSSL library
+    through two symlinks, which makes an otherwise successful standalone build
+    fail during its final dependency fixup. Nuitka's upstream scanner now uses
+    ``areSamePaths`` for this comparison.
+    """
+
+    old = "if resolved_filename == standalone_entry_point.source_path:"
+    new = "if areSamePaths(resolved_filename, standalone_entry_point.source_path):"
+    source = dependency_scan_file.read_text(encoding="utf-8")
+    if new in source:
+        return False
+    if old not in source:
+        raise RuntimeError("Unsupported Nuitka macOS dependency scanner; refusing an unsafe patch")
+    dependency_scan_file.write_text(source.replace(old, new, 1), encoding="utf-8")
+    return True
+
+
+def nuitka_macos_dependency_scan_file() -> Path:
+    import nuitka
+
+    return Path(nuitka.__file__).resolve().parent / "freezer" / "DllDependenciesMacOS.py"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--platform", required=True)
@@ -61,6 +88,10 @@ def main() -> int:
     command.append("src/ai_organizer/bootstrap/main.py")
     environment = os.environ.copy()
     environment.setdefault("NUITKA_CACHE_DIR", str(root / ".nuitka-cache"))
+    if sys.platform == "darwin":
+        dependency_scan_file = nuitka_macos_dependency_scan_file()
+        if patch_nuitka_macos_symlink_scan(dependency_scan_file):
+            print(f"Applied symlink-safe Nuitka macOS scanner fix: {dependency_scan_file}")
     subprocess.run(
         command,
         cwd=root,
