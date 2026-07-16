@@ -65,7 +65,7 @@ jobs:
         if: matrix.publish
         shell: bash
         run: uv run cyclonedx-py environment --output-format JSON --output-file artifacts/AIOrganizer-${{ matrix.artifact }}.cdx.json
-      - uses: actions/attest-sbom@51e74621a501c89df81fc1391c5a8f4cfc9fab2f # v3
+      - uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
         if: matrix.publish
         with:
           subject-path: artifacts/${{ matrix.package }}
@@ -108,7 +108,7 @@ jobs:
         run: build/portable-macos-universal2/main.dist/AIOrganizer --smoke-test
       - name: Generate SBOM
         run: uv run cyclonedx-py environment --output-format JSON --output-file artifacts/AIOrganizer-macos-universal2.cdx.json
-      - uses: actions/attest-sbom@51e74621a501c89df81fc1391c5a8f4cfc9fab2f # v3
+      - uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3
         with:
           subject-path: artifacts/AIOrganizer-macos-universal2.zip
           sbom-path: artifacts/AIOrganizer-macos-universal2.cdx.json
