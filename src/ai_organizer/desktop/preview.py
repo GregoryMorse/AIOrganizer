@@ -17,8 +17,6 @@ from PySide6.QtGui import (
     QSyntaxHighlighter,
     QTextCharFormat,
 )
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
 from PySide6.QtWidgets import (
@@ -41,6 +39,17 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+    from PySide6.QtMultimediaWidgets import QVideoWidget
+except (ImportError, OSError):
+    # Some otherwise-supported Linux desktops do not provide PulseAudio's
+    # shared library. Keep document inspection available and disable only the
+    # optional embedded media player on those hosts.
+    QAudioOutput = None  # type: ignore[assignment,misc]
+    QMediaPlayer = None  # type: ignore[assignment,misc]
+    QVideoWidget = None  # type: ignore[assignment,misc]
 
 _MAX_TEXT_BYTES = 1_000_000
 _HEX_PAGE_BYTES = 16 * 256
@@ -728,6 +737,17 @@ class FilePreview(QWidget):
     def _build_media_view(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        if QAudioOutput is None or QMediaPlayer is None or QVideoWidget is None:
+            self.video = QWidget()
+            self.media_label = QLabel(
+                "Embedded media preview is unavailable because this system is missing "
+                "a Qt Multimedia runtime library. The file can still be opened externally."
+            )
+            self.media_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.media_label.setWordWrap(True)
+            layout.addWidget(self.media_label, 1)
+            self.player = None
+            return widget
         self.video = QVideoWidget()
         self.video.setMinimumHeight(180)
         layout.addWidget(self.video, 1)
@@ -756,6 +776,10 @@ class FilePreview(QWidget):
         return widget
 
     def _show_media(self, path: Path, *, video: bool) -> None:
+        if self.player is None:
+            self.preview_stack.setCurrentWidget(self.media)
+            self.tabs.setCurrentWidget(self.preview_stack)
+            return
         self.player.setSource(QUrl.fromLocalFile(str(path)))
         self.video.setVisible(video)
         self.media_label.setText(path.name if video else f"Audio: {path.name}")
@@ -763,28 +787,38 @@ class FilePreview(QWidget):
         self.tabs.setCurrentWidget(self.preview_stack)
 
     def _toggle_media(self) -> None:
+        if self.player is None:
+            return
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
         else:
             self.player.play()
 
     def _stop_media(self) -> None:
-        if hasattr(self, "player"):
+        if getattr(self, "player", None) is not None:
             self.player.stop()
             self.player.setSource(QUrl())
 
     def _seek_media(self, position: int) -> None:
+        if self.player is None:
+            return
         self.player.setPosition(position)
 
     def _media_position_changed(self, position: int) -> None:
+        if self.player is None:
+            return
         self.position.setValue(position)
         self.media_time.setText(f"{_media_time(position)} / {_media_time(self.player.duration())}")
 
     def _media_duration_changed(self, duration: int) -> None:
+        if self.player is None:
+            return
         self.position.setRange(0, max(0, duration))
         self._media_position_changed(self.player.position())
 
     def _media_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
+        if self.player is None:
+            return
         self.play_button.setText(
             "Pause" if state == QMediaPlayer.PlaybackState.PlayingState else "Play"
         )

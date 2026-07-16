@@ -177,7 +177,11 @@ def test_legacy_ttl_column_is_removed_without_losing_metadata(tmp_path: Path) ->
 def test_executable_metadata_includes_native_header_properties() -> None:
     metadata = _executable_metadata(Path(sys.executable))
 
-    expected = "pe" if platform.system() == "Windows" else "elf"
+    expected = {
+        "Windows": "pe",
+        "Darwin": "mach-o",
+        "Linux": "elf",
+    }[platform.system()]
     assert metadata["binary_format"] == expected
     assert metadata.get("machine") or metadata.get("machine_id")
     if platform.system() == "Windows":
