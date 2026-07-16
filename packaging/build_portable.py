@@ -14,18 +14,26 @@ def patch_nuitka_macos_symlink_scan(dependency_scan_file: Path) -> bool:
     Nuitka 2.8.10 compares a resolved dylib path with its collected source path
     as strings. Homebrew's Intel runner paths can name the same OpenSSL library
     through two symlinks, which makes an otherwise successful standalone build
-    fail during its final dependency fixup. Nuitka's upstream scanner now uses
-    ``areSamePaths`` for this comparison.
+    fail during its final dependency fixup. Resolve both names before applying
+    Nuitka's normalized-path comparison because ``areSamePaths`` itself does
+    not resolve POSIX symlinks.
     """
 
     old = "if resolved_filename == standalone_entry_point.source_path:"
-    new = "if areSamePaths(resolved_filename, standalone_entry_point.source_path):"
+    upstream = "if areSamePaths(resolved_filename, standalone_entry_point.source_path):"
+    fixed = (
+        "if areSamePaths(\n"
+        "                    os.path.realpath(resolved_filename),\n"
+        "                    os.path.realpath(standalone_entry_point.source_path),\n"
+        "                ):"
+    )
     source = dependency_scan_file.read_text(encoding="utf-8")
-    if new in source:
+    if fixed in source:
         return False
-    if old not in source:
+    candidate = upstream if upstream in source else old
+    if candidate not in source:
         raise RuntimeError("Unsupported Nuitka macOS dependency scanner; refusing an unsafe patch")
-    dependency_scan_file.write_text(source.replace(old, new, 1), encoding="utf-8")
+    dependency_scan_file.write_text(source.replace(candidate, fixed, 1), encoding="utf-8")
     return True
 
 
@@ -91,7 +99,10 @@ def main() -> int:
     if sys.platform == "darwin":
         dependency_scan_file = nuitka_macos_dependency_scan_file()
         if patch_nuitka_macos_symlink_scan(dependency_scan_file):
-            print(f"Applied symlink-safe Nuitka macOS scanner fix: {dependency_scan_file}")
+            print(
+                f"Applied symlink-safe Nuitka macOS scanner fix: {dependency_scan_file}",
+                flush=True,
+            )
     subprocess.run(
         command,
         cwd=root,
