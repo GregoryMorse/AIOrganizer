@@ -746,6 +746,16 @@ class FilePreview(QWidget):
             self.media_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.media_label.setWordWrap(True)
             layout.addWidget(self.media_label, 1)
+            controls = QHBoxLayout()
+            self.play_button = QPushButton("Play")
+            self.play_button.setEnabled(False)
+            self.position = QSlider(Qt.Orientation.Horizontal)
+            self.position.setEnabled(False)
+            self.media_time = QLabel("00:00 / 00:00")
+            controls.addWidget(self.play_button)
+            controls.addWidget(self.position, 1)
+            controls.addWidget(self.media_time)
+            layout.addLayout(controls)
             self.player = None
             return widget
         self.video = QVideoWidget()

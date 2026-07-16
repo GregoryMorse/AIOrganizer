@@ -183,10 +183,14 @@ def test_executable_metadata_includes_native_header_properties() -> None:
         "Linux": "elf",
     }[platform.system()]
     assert metadata["binary_format"] == expected
-    assert metadata.get("machine") or metadata.get("machine_id")
     if platform.system() == "Windows":
+        assert metadata.get("machine")
         assert metadata["pe_kind"] in {"PE32", "PE32+"}
         assert metadata["fixed_file_version"]
+    elif platform.system() == "Darwin":
+        assert metadata.get("cpu_type") or metadata.get("architectures")
+    else:
+        assert metadata.get("machine_id")
 
 
 def test_os_metadata_merge_is_visible_in_cache_and_latest_snapshot(tmp_path: Path) -> None:
