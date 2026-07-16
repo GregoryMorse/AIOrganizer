@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from ai_organizer.domain.prompts import redact_sensitive
+from ai_organizer.domain.prompts import is_valid_iban, redact_sensitive
 
 SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_ -]?key|token|password|secret)\s*[:=]\s*([^\s,;]+)"),
@@ -78,11 +78,14 @@ def detect_secret_kinds(text: str) -> list[str]:
         "private_key",
         "short_code",
     ]
-    return [
-        label
-        for label, pattern in zip(labels, SECRET_PATTERNS, strict=True)
-        if pattern.search(text)
-    ]
+    detected: list[str] = []
+    for label, pattern in zip(labels, SECRET_PATTERNS, strict=True):
+        if label == "iban":
+            if any(is_valid_iban(match.group(0)) for match in pattern.finditer(text)):
+                detected.append(label)
+        elif pattern.search(text):
+            detected.append(label)
+    return detected
 
 
 def parse_findings(text: str) -> list[dict[str, Any]]:

@@ -228,14 +228,29 @@ def sensitive_fragments(text: str) -> list[str]:
     values = [match.group(0) for match in _PRIVATE_KEY.finditer(text)]
     values.extend(match.group(2) for match in _SECRET_ASSIGNMENT.finditer(text))
     values.extend(match.group(2) for match in _SECURITY_CODE.finditer(text))
-    values.extend(match.group(0) for match in _IBAN.finditer(text))
+    values.extend(match.group(0) for match in _IBAN.finditer(text) if is_valid_iban(match.group(0)))
     values.extend(match.group(0) for match in _LONG_IDENTIFIER.finditer(text))
     return list(dict.fromkeys(value for value in values if value))
 
 
 def _mask_iban(match: re.Match[str]) -> str:
     compact = re.sub(r"[ -]", "", match.group(0))
+    if not is_valid_iban(compact):
+        return match.group(0)
     return f"[IBAN MASKED…{compact[-4:]}]"
+
+
+def is_valid_iban(value: str) -> bool:
+    """Validate an IBAN candidate before treating an arbitrary token as financial data."""
+    compact = re.sub(r"[ -]", "", value).upper()
+    if not re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]{11,30}", compact):
+        return False
+    rearranged = compact[4:] + compact[:4]
+    numeric = "".join(
+        character if character.isdigit() else str(ord(character) - ord("A") + 10)
+        for character in rearranged
+    )
+    return int(numeric) % 97 == 1
 
 
 def _mask_long_identifier(match: re.Match[str]) -> str:

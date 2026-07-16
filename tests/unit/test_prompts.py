@@ -65,6 +65,13 @@ def test_cloud_redaction_masks_formatted_financial_and_security_values(
     assert redact(value) == masked
 
 
+def test_iban_redaction_rejects_random_path_tokens() -> None:
+    value = "/private/var/folders/6x/bw25zx1s3p5655vw5gd7c8j40000gn/T/document.pdf"
+
+    assert redact_sensitive(value) == value
+    assert "iban" not in detect_secret_kinds(value)
+
+
 def test_user_private_values_are_redacted_without_entering_prompt_provenance() -> None:
     private_value = "Example Family Reference 42"
     compiled = PromptCompiler([private_value]).compile(
