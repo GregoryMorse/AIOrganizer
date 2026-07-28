@@ -50,7 +50,7 @@ providers = [
   "openai-codex>=0.1.0b1; sys_platform != 'linux'",
 ]
 mcp = [
-  "mcp[cli]>=1.27,<2",
+  "mcp[cli]>=1.27,<3",
 ]
 email = [
   "keyring>=25,<27",
