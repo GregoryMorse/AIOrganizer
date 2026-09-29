@@ -8,7 +8,7 @@
     "validate": "office-addin-manifest validate manifest.xml"
   },
   "devDependencies": {
-    "office-addin-dev-certs": "2.0.10",
+    "office-addin-dev-certs": "3.0.1",
     "office-addin-manifest": "2.1.6"
   }
 }
