@@ -44,7 +44,7 @@ analysis = [
 providers = [
   "anthropic>=0.68,<1",
   "keyring>=25,<27",
-  "openai>=2,<3",
+  "openai>=2,<4",
   # The SDK's bundled CLI currently has no glibc Linux wheel. Linux still
   # supports compatible user-installed Codex runtimes via app-server.
   "openai-codex>=0.1.0b1; sys_platform != 'linux'",
