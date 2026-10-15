@@ -4,8 +4,10 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from pypdf import PdfWriter
 from PySide6.QtGui import QImage, QPainter, QPdfWriter
 
+from ai_organizer.application.pdf_repair import _append_invisible_ocr_lines
 from ai_organizer.desktop.controller import WorkspaceController
 from ai_organizer.desktop.pages import InventoryPage, RenamePage, UpdatesPage
 from ai_organizer.desktop.preview import FilePreview
@@ -128,3 +130,59 @@ def test_file_backed_pages_use_the_shared_inspector(qtbot) -> None:  # type: ign
     for page in pages:
         qtbot.addWidget(page)
         assert page.findChildren(FilePreview)
+
+
+@pytest.mark.ui
+def test_inventory_pdf_preview_runs_shared_local_extraction_without_ocr(
+    qtbot, tmp_path: Path
+) -> None:  # type: ignore[no-untyped-def]
+    source_path = tmp_path / "source"
+    source_path.mkdir()
+    pdf_path = source_path / "statement.pdf"
+    writer = PdfWriter()
+    page_object = writer.add_blank_page(width=612, height=792)
+    _append_invisible_ocr_lines(
+        writer,
+        page_object,
+        0,
+        [
+            {
+                "line_id": "line-1",
+                "text": "Statement date and interest income",
+                "bounds": [0.1, 0.1, 0.5, 0.04],
+            }
+        ],
+        {},
+    )
+    writer.write(pdf_path)
+
+    controller = WorkspaceController()
+    controller.create_workspace(tmp_path / "inventory-preview.aioworkspace", "Inventory preview")
+    source = controller.add_source(source_path)
+    stat = pdf_path.stat()
+    controller.items = [
+        {
+            "id": "item_statement",
+            "root_id": source.id,
+            "relative_path": pdf_path.name,
+            "mime_type": "application/pdf",
+            "size": stat.st_size,
+            "modified_ns": stat.st_mtime_ns,
+            "created_ns": stat.st_ctime_ns,
+            "is_dir": False,
+            "is_placeholder": False,
+            "metadata": {},
+        }
+    ]
+    page = InventoryPage(controller)
+    qtbot.addWidget(page)
+    page.refresh()
+
+    index = page.model.index(0, 0)
+    page.table.setCurrentIndex(index)
+    page.table.clicked.emit(index)
+
+    assert "Statement date and interest income" in page.file_preview.text.toPlainText()
+    records = controller.store.list_evidence_payloads({"item_statement"})["evidence"]
+    assert records[0]["extractor_version"] == "5"
+    assert records[0]["facts"]["ocr_attempted"] is False

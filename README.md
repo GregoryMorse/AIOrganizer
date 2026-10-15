@@ -138,12 +138,23 @@ until reviewed again. The attachment boundary accepts metadata-only descriptors 
 attachment against an individually missing period. It deliberately exposes no download method and
 has no Outlook dependency.
 
-## Phase 6 Microsoft Graph email
+## Phase 6 Outlook email
 
-Email is an optional Microsoft Graph connector with one active delegated account at a time. Put a
-public/native Microsoft Entra application ID in `AIORGANIZER_GRAPH_CLIENT_ID` in the ignored `.env`
-file, install the `email` extra, restart `dev.cmd`, and use **Email → Sign in read-only**. The app
-opens Microsoft's device sign-in flow; it never asks for a Microsoft password or client secret.
+Email supports two isolated connectors with one active mailbox at a time. On Windows, **Mailbox →
+Connect another Outlook mailbox** can discover the mail stores already authenticated in Classic
+Outlook through local COM. Discovery reads identities only; refreshing then enumerates folders and
+caches at most 500 recent messages per selected folder and 5,000 per refresh. With no folder selected,
+only Inbox is sampled. Message previews pass through the same bounded secret redaction as Graph, and
+attachment bytes are never read. Classic Outlook access is currently read-only; it requests no Entra
+application consent and no COM write is exposed.
+
+The same command can instead connect Microsoft Graph. In **Mail → Settings → Outlook &
+Permissions**, enter a public/native Microsoft Entra application ID and its tenant/audience and save
+the binding first. The app opens Microsoft's device sign-in flow; it never asks for a Microsoft
+password or client secret. Configured local and Graph accounts remain available under **Mailbox →
+Select active mailbox**, labeled by connector, so cached views and proposals cannot cross mailbox
+boundaries. The ignored `AIORGANIZER_GRAPH_CLIENT_ID` and `AIORGANIZER_GRAPH_AUTHORITY` environment
+values remain optional deployment/development fallbacks when no in-app binding is saved.
 
 Initial consent is limited to `User.Read` and `Mail.Read`. Read refreshes use a separate delta cursor
 for every selected mail folder and cache bounded, redacted message previews plus attachment metadata.
@@ -173,8 +184,9 @@ save, and imported Outlook selections. These are cautious review findings, not c
 forgotten or an attachment is definitely unsaved.
 
 The automated Phase 6 suite uses a fake Graph transport for paging, delta, permission, conflict, and
-no-send/no-delete checks. A real test-tenant soak remains an explicit release gate and is not run by
-the normal Python development loop.
+no-send/no-delete checks, plus a fake Outlook Object Model profile for bounded local discovery and
+refresh. No personal mailbox data is a test fixture. A real test-tenant soak remains an explicit
+release gate and is not run by the normal Python development loop.
 
 ## Phase 7 companion, export, and release groundwork
 

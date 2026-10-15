@@ -3,9 +3,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QDialog,
+    QDialogButtonBox,
     QLabel,
     QProgressBar,
     QVBoxLayout,
@@ -48,6 +49,7 @@ class BackgroundTaskDialog(QDialog):
         parent: QWidget | None = None,
         *,
         progress_aware: bool = False,
+        cancel_operation: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -55,6 +57,8 @@ class BackgroundTaskDialog(QDialog):
         self.setMinimumWidth(480)
         self.result_value: Any = None
         self.error_message = ""
+        self.cancel_operation = cancel_operation
+        self.cancel_requested = False
         layout = QVBoxLayout(self)
         self.label = QLabel(message)
         self.label.setWordWrap(True)
@@ -62,6 +66,11 @@ class BackgroundTaskDialog(QDialog):
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         layout.addWidget(self.progress)
+        self.buttons: QDialogButtonBox | None = None
+        if cancel_operation:
+            self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+            self.buttons.rejected.connect(self.reject)
+            layout.addWidget(self.buttons)
         self.thread = QThread(self)
         self.worker = BackgroundTaskWorker(operation, progress_aware)
         self.worker.moveToThread(self.thread)
@@ -69,8 +78,8 @@ class BackgroundTaskDialog(QDialog):
         self.worker.completed.connect(self._completed)
         self.worker.failed.connect(self._failed)
         self.worker.progressed.connect(self._progressed)
-        self.worker.completed.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
+        self.worker.completed.connect(self.thread.quit, Qt.ConnectionType.DirectConnection)
+        self.worker.failed.connect(self.thread.quit, Qt.ConnectionType.DirectConnection)
 
     def run(self) -> int:
         self.thread.start()
@@ -79,13 +88,25 @@ class BackgroundTaskDialog(QDialog):
         return code
 
     def reject(self) -> None:
+        if self.thread.isRunning() and self.cancel_operation:
+            if not self.cancel_requested:
+                self.cancel_requested = True
+                self.label.setText("Cancelling…")
+                if self.buttons:
+                    self.buttons.setEnabled(False)
+                self.cancel_operation()
+            QDialog.reject(self)
+            return
         if not self.thread.isRunning():
-            super().reject()
+            QDialog.reject(self)
 
     @Slot(object)
     def _completed(self, value: object) -> None:
         self.result_value = value
-        self.accept()
+        if self.cancel_requested:
+            QDialog.reject(self)
+        else:
+            self.accept()
 
     @Slot(str)
     def _failed(self, message: str) -> None:

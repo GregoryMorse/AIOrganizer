@@ -4,11 +4,17 @@ from collections import defaultdict
 from dataclasses import replace
 from typing import Any
 
-from ai_organizer.adapters.email import GraphClient, RemoteConflict
+from ai_organizer.adapters.email import (
+    ClassicOutlookClient,
+    ClassicOutlookMailbox,
+    GraphClient,
+    RemoteConflict,
+)
 from ai_organizer.adapters.persistence import WorkspaceStore
 from ai_organizer.domain.email import (
     AccountSecurityEvidence,
     EmailAccount,
+    EmailConnectorKind,
     EmailProposal,
     EmailProposalKind,
     EmailProposalStatus,
@@ -27,7 +33,7 @@ from ai_organizer.domain.recurrence import (
 
 
 class EmailService:
-    """Orchestrates the read cache and narrowly typed, user-approved Graph writes."""
+    """Orchestrates provider-isolated mail caches and narrowly typed Graph writes."""
 
     def __init__(self, store: WorkspaceStore, graph: GraphClient) -> None:
         self.store = store
@@ -44,6 +50,35 @@ class EmailService:
         username = str(profile.get("mail") or profile.get("userPrincipalName") or "")
         if not username:
             raise RuntimeError("Microsoft Graph did not return a mailbox identity")
+        existing = next(
+            (
+                value
+                for value in self.store.list_email_accounts()
+                if (
+                    value.get("connector_kind", EmailConnectorKind.MICROSOFT_GRAPH.value)
+                    == EmailConnectorKind.MICROSOFT_GRAPH.value
+                    and (
+                        (
+                            home_account_id
+                            and str(value.get("home_account_id", "")) == home_account_id
+                        )
+                        or (
+                            str(value.get("username", "")).casefold() == username.casefold()
+                            and str(value.get("tenant_id", "")) == tenant_id
+                        )
+                    )
+                )
+            ),
+            None,
+        )
+        remote_id = str(profile.get("id") or "")
+        account_id = (
+            str(existing["id"])
+            if existing
+            else f"graph:{home_account_id or f'{tenant_id}:{remote_id}'}"
+            if home_account_id or tenant_id or remote_id
+            else EmailAccount(username, username).id
+        )
         account = EmailAccount(
             username,
             str(profile.get("displayName") or username),
@@ -51,11 +86,50 @@ class EmailService:
             home_account_id,
             tuple(sorted(set(granted_scopes))),
             True,
-            str(profile.get("id") or "") or EmailAccount(username, username).id,
+            account_id,
+            int((existing or {}).get("revision", 0)) + 1,
         )
         self.store.save_email_account(account)
         self.store.activity("email.account", f"Activated delegated mailbox {username}")
         return account
+
+    def register_classic_outlook_accounts(
+        self, mailboxes: list[ClassicOutlookMailbox]
+    ) -> list[EmailAccount]:
+        if not mailboxes:
+            raise RuntimeError("Classic Outlook did not expose any configured mail stores")
+        existing_by_ref = {
+            str(value.get("connector_ref", "")): value
+            for value in self.store.list_email_accounts()
+            if value.get("connector_kind") == EmailConnectorKind.CLASSIC_OUTLOOK.value
+        }
+        active = self.active_account()
+        active_id = active.id if active else ""
+        accounts: list[EmailAccount] = []
+        for index, mailbox in enumerate(mailboxes):
+            existing = existing_by_ref.get(mailbox.store_id)
+            preserve_active = (
+                str(existing.get("id")) == active_id
+                if existing
+                else not active_id and index == 0
+            )
+            account = EmailAccount(
+                username=sanitized_preview(mailbox.username, 320),
+                display_name=sanitized_preview(mailbox.display_name, 320),
+                granted_scopes=(),
+                active=preserve_active,
+                id=str(existing.get("id")) if existing else mailbox.account_id,
+                revision=int((existing or {}).get("revision", 0)) + 1,
+                connector_kind=EmailConnectorKind.CLASSIC_OUTLOOK.value,
+                connector_ref=mailbox.store_id,
+            )
+            self.store.save_email_account(account)
+            accounts.append(account)
+        self.store.activity(
+            "email.account",
+            f"Connected {len(accounts)} read-only Classic Outlook mailbox store(s)",
+        )
+        return accounts
 
     def sync_read_only(
         self,
@@ -121,6 +195,65 @@ class EmailService:
             "security_evidence": len(evidence),
         }
 
+    def sync_classic_outlook_read_only(
+        self,
+        account: EmailAccount,
+        client: ClassicOutlookClient,
+        folder_ids: tuple[str, ...] = (),
+    ) -> dict[str, int | bool]:
+        if account.connector_kind != EmailConnectorKind.CLASSIC_OUTLOOK.value:
+            raise ValueError("The selected mailbox is not connected through Classic Outlook")
+        snapshot = client.snapshot(account.id, account.connector_ref, folder_ids)
+        folders = [
+            replace(folder, display_name=sanitized_preview(folder.display_name, 300))
+            for folder in snapshot.folders
+        ]
+        messages = [
+            replace(
+                message,
+                subject=sanitized_preview(message.subject, 300),
+                sender_name=sanitized_preview(message.sender_name, 180),
+                sender_address=sanitized_preview(message.sender_address, 320),
+                body_preview=sanitized_preview(message.body_preview),
+                to_recipients=tuple(
+                    sanitized_preview(value, 320) for value in message.to_recipients
+                ),
+                cc_recipients=tuple(
+                    sanitized_preview(value, 320) for value in message.cc_recipients
+                ),
+            )
+            for message in snapshot.messages
+        ]
+        attachments = [
+            replace(
+                attachment,
+                filename=sanitized_preview(attachment.filename, 255),
+                sanitized_subject=sanitized_preview(attachment.sanitized_subject, 300),
+            )
+            for attachment in snapshot.attachments
+        ]
+        self.store.save_mail_folders(folders)
+        self.store.apply_mail_delta(messages)
+        self.store.save_mail_attachments(attachments)
+        evidence = self._account_evidence(account)
+        self.store.save_account_security_evidence(account.id, evidence)
+        self.store.activity(
+            "email.sync",
+            f"Classic Outlook refresh recorded {len(messages)} bounded message item(s)",
+            {
+                "folders": len(folders),
+                "attachments": len(attachments),
+                "truncated": snapshot.truncated,
+            },
+        )
+        return {
+            "folders": len(folders),
+            "messages": len(messages),
+            "attachments": len(attachments),
+            "security_evidence": len(evidence),
+            "truncated": snapshot.truncated,
+        }
+
     def propose(self, proposal: EmailProposal) -> EmailProposal:
         active = self.active_account()
         if active is None or active.id != proposal.account_id:
@@ -141,6 +274,10 @@ class EmailService:
         account = self.active_account()
         if account is None:
             raise RuntimeError("No active email account")
+        if account.connector_kind != EmailConnectorKind.MICROSOFT_GRAPH.value:
+            raise PermissionError(
+                "Classic Outlook mailboxes are read-only in this version; no COM write was attempted"
+            )
         proposals = [
             _proposal_from_payload(value)
             for value in self.store.list_email_proposals(account.id)
@@ -163,6 +300,10 @@ class EmailService:
         account = self.active_account()
         if account is None:
             raise RuntimeError("No active email account")
+        if account.connector_kind != EmailConnectorKind.MICROSOFT_GRAPH.value:
+            raise PermissionError(
+                "Classic Outlook mailboxes are read-only in this version; no COM write was attempted"
+            )
         payloads = self.store.list_email_proposals(account.id)
         proposals = [
             _proposal_from_payload(value) for value in payloads if value["id"] in proposal_ids
@@ -214,6 +355,27 @@ class EmailService:
             (value for value in self.store.list_email_accounts() if value["active"]), None
         )
         return _account_from_payload(payload) if payload else None
+
+    def accounts(self) -> list[EmailAccount]:
+        return [_account_from_payload(value) for value in self.store.list_email_accounts()]
+
+    def activate_account(self, account_id: str) -> EmailAccount:
+        payload = next(
+            (value for value in self.store.list_email_accounts() if value["id"] == account_id),
+            None,
+        )
+        if payload is None:
+            raise ValueError("The selected mailbox is no longer configured")
+        account = _account_from_payload(payload)
+        if not account.active:
+            account.active = True
+            account.revision += 1
+            account.updated_at = utc_now()
+            self.store.save_email_account(account)
+            self.store.activity(
+                "email.account_activated", f"Activated mailbox {account.username}"
+            )
+        return account
 
     def recurring_attachment_matches(
         self, account_id: str, series: RecurrenceSeries, missing_periods: set[str]
@@ -339,6 +501,8 @@ def _account_from_payload(value: dict[str, Any]) -> EmailAccount:
         str(value["id"]),
         int(value.get("revision", 1)),
         str(value.get("updated_at", utc_now())),
+        str(value.get("connector_kind", EmailConnectorKind.MICROSOFT_GRAPH.value)),
+        str(value.get("connector_ref", "")),
     )
 
 

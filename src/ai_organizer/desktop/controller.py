@@ -88,6 +88,7 @@ class WorkspaceController(QObject):
     prompt_changed = Signal(str)
     software_changed = Signal()
     recurrence_changed = Signal()
+    mail_account_changed = Signal()
 
     def __init__(self) -> None:
         super().__init__()

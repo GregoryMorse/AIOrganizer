@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import os
 import re
+import shutil
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
+from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from uuid import uuid4
 
 from ai_organizer.domain.prompts import sensitive_fragments
 
@@ -44,6 +48,25 @@ class PdfCompressionProposal:
     @property
     def savings_percent(self) -> float:
         return 100 * self.savings_bytes / max(1, self.source_bytes)
+
+
+@dataclass(frozen=True, slots=True)
+class PdfOcrProposal:
+    output_path: Path
+    page_count: int
+    searchable_pages: int
+    rasterized_pages: int
+    positioned_lines: int
+    page_boxes_match: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PdfRepairCommitResult:
+    source_path: Path
+    output_path: Path
+    backup_path: Path | None
+    overwritten: bool
+    repair_kind: Literal["ocr", "compression", "both"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,11 +202,20 @@ def restore_ocr_line_corrections(
         if not suggestion:
             raise ValueError("AI OCR correction returned an empty positioned line")
         restored = value.envelope.restore(suggestion)
+        if len(restored) != len(value.original_text):
+            raise ValueError("AI OCR correction changed positioned-line length")
+        original_spaces = tuple(
+            index for index, character in enumerate(value.original_text) if character.isspace()
+        )
+        restored_spaces = tuple(
+            index for index, character in enumerate(restored) if character.isspace()
+        )
+        if restored_spaces != original_spaces:
+            raise ValueError("AI OCR correction changed positioned-line whitespace")
         similarity = SequenceMatcher(
             None, value.original_text.casefold(), restored.casefold(), autojunk=False
         ).ratio()
-        length_ratio = len(restored) / max(1, len(value.original_text))
-        if similarity < 0.55 or not 0.5 <= length_ratio <= 2.0:
+        if similarity < 0.8:
             raise ValueError("AI OCR correction rewrote a line beyond the safe correction bound")
         corrected.append(
             {
@@ -208,6 +240,337 @@ def positioned_text(corrections: list[dict[str, Any]]) -> str:
     return "\n\n".join(
         f"--- Page {page_index + 1} ---\n" + "\n".join(lines)
         for page_index, lines in sorted(pages.items())
+    )
+
+
+def build_searchable_pdf(
+    source: Path,
+    output: Path,
+    layout_pages: dict[str, Any],
+    corrections: list[dict[str, Any]] | None = None,
+    embedded_pages: list[str] | tuple[str, ...] = (),
+    *,
+    raster_dpi: int = 300,
+) -> PdfOcrProposal:
+    """Build a visually reviewed PDF with bounded, positioned invisible OCR text.
+
+    Image-only pages retain their original PDF content. Pages with a defective
+    embedded text layer are rasterized at high resolution before the corrected
+    OCR layer is added, avoiding duplicate searchable text while preserving the
+    reviewed visual appearance.
+    """
+    from PIL import Image
+    from pypdf import PdfReader, PdfWriter
+    from PySide6.QtCore import QSize
+    from PySide6.QtPdf import QPdfDocument
+
+    if not layout_pages:
+        raise ValueError("No positioned OCR pages are available")
+    source = source.resolve(strict=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    reader = PdfReader(source, strict=False)
+    if reader.is_encrypted:
+        raise ValueError("Encrypted PDF cannot receive a searchable OCR layer")
+    corrections_by_line = {
+        (int(value["page_index"]), str(value["line_id"])): str(value["corrected_text"])
+        for value in corrections or []
+    }
+    parsed_layout = {
+        int(page_key): page for page_key, page in layout_pages.items() if isinstance(page, dict)
+    }
+    if any(index < 0 or index >= len(reader.pages) for index in parsed_layout):
+        raise ValueError("OCR layout references a page outside the PDF")
+    document = QPdfDocument()
+    if document.load(str(source)) != QPdfDocument.Error.None_:
+        raise ValueError("Qt could not render the OCR proposal source")
+    writer = PdfWriter()
+    rasterized_pages = 0
+    positioned_lines = 0
+    try:
+        for page_index, source_page in enumerate(reader.pages):
+            layout = parsed_layout.get(page_index)
+            has_embedded_text = bool(
+                page_index < len(embedded_pages) and str(embedded_pages[page_index]).strip()
+            )
+            if layout is not None and has_embedded_text:
+                points = document.pagePointSize(page_index)
+                target_width = max(1, round(points.width() / 72 * raster_dpi))
+                target_height = max(1, round(points.height() / 72 * raster_dpi))
+                scale = min(1.0, 4800 / max(target_width, target_height))
+                image = document.render(
+                    page_index,
+                    QSize(
+                        max(1, round(target_width * scale)),
+                        max(1, round(target_height * scale)),
+                    ),
+                )
+                if image.isNull():
+                    raise RuntimeError(f"Could not render PDF page {page_index + 1}")
+                buffer = BytesIO()
+                pil_image = Image.fromqimage(image).convert("RGB")
+                pil_image.save(buffer, "PDF", resolution=raster_dpi, quality=95)
+                buffer.seek(0)
+                raster_page = PdfReader(buffer, strict=False).pages[0]
+                writer.add_page(raster_page)
+                writer.pages[-1].scale_to(
+                    float(source_page.mediabox.width), float(source_page.mediabox.height)
+                )
+                rasterized_pages += 1
+            else:
+                writer.add_page(source_page)
+            if layout is not None:
+                lines = [value for value in layout.get("lines", []) if isinstance(value, dict)]
+                positioned_lines += _append_invisible_ocr_lines(
+                    writer,
+                    writer.pages[-1],
+                    page_index,
+                    lines,
+                    corrections_by_line,
+                )
+        if reader.metadata:
+            writer.add_metadata({str(key): str(value) for key, value in reader.metadata.items()})
+        writer.write(output)
+    finally:
+        document.close()
+    proposed = PdfReader(output, strict=False)
+    boxes_match = len(proposed.pages) == len(reader.pages) and all(
+        tuple(float(value) for value in proposed.pages[index].mediabox)
+        == tuple(float(value) for value in reader.pages[index].mediabox)
+        for index in range(len(reader.pages))
+    )
+    if not boxes_match:
+        output.unlink(missing_ok=True)
+        raise RuntimeError("OCR proposal changed page count or page geometry")
+    return PdfOcrProposal(
+        output,
+        len(proposed.pages),
+        len(parsed_layout),
+        rasterized_pages,
+        positioned_lines,
+        boxes_match,
+    )
+
+
+def commit_repaired_pdf(
+    source: Path,
+    prepared: Path,
+    root: Path,
+    relative_path: str,
+    *,
+    digitally_signed: bool,
+    repair_kind: Literal["ocr", "compression", "both"],
+) -> PdfRepairCommitResult:
+    """Atomically commit a validated PDF, retaining originals for recovery."""
+    from pypdf import PdfReader
+
+    source = source.resolve(strict=True)
+    prepared = prepared.resolve(strict=True)
+    root = root.resolve(strict=True)
+    try:
+        source.relative_to(root)
+    except ValueError as error:
+        raise PermissionError("PDF repair source is outside its configured root") from error
+    relative = Path(relative_path)
+    if relative.is_absolute() or ".." in relative.parts or (root / relative).resolve() != source:
+        raise PermissionError("PDF repair relative path does not identify the source")
+    if source == prepared:
+        raise ValueError("Prepared PDF must be separate from the source")
+    source_reader = PdfReader(source, strict=False)
+    prepared_reader = PdfReader(prepared, strict=False)
+    if len(source_reader.pages) != len(prepared_reader.pages):
+        raise RuntimeError("Prepared PDF page count differs from the source")
+    if not all(
+        tuple(float(value) for value in source_reader.pages[index].mediabox)
+        == tuple(float(value) for value in prepared_reader.pages[index].mediabox)
+        for index in range(len(source_reader.pages))
+    ):
+        raise RuntimeError("Prepared PDF page geometry differs from the source")
+    operation_id = f"pdfrepair_{uuid4().hex}"
+    if digitally_signed:
+        suffix = "-compressed" if repair_kind == "compression" else "-rebuilt-with-text"
+        output = source.with_name(f"{source.stem}{suffix}{source.suffix}")
+        if output.exists():
+            raise FileExistsError(f"Signed-PDF derivative already exists: {output.name}")
+        _atomic_copy(prepared, output, operation_id)
+        return PdfRepairCommitResult(source, output, None, False, repair_kind)
+    backup = root / ".AIOrganizer-Quarantine" / "pdf-repair" / operation_id / relative
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    staged = source.with_name(f".{source.name}.{operation_id}.tmp")
+    shutil.copy2(prepared, staged)
+    try:
+        os.replace(source, backup)
+        try:
+            os.replace(staged, source)
+        except Exception:
+            os.replace(backup, source)
+            raise
+    finally:
+        staged.unlink(missing_ok=True)
+    return PdfRepairCommitResult(source, source, backup, True, repair_kind)
+
+
+def _atomic_copy(source: Path, target: Path, operation_id: str) -> None:
+    staged = target.with_name(f".{target.name}.{operation_id}.tmp")
+    try:
+        shutil.copy2(source, staged)
+        os.replace(staged, target)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def _append_invisible_ocr_lines(
+    writer: Any,
+    page: Any,
+    page_index: int,
+    lines: list[dict[str, Any]],
+    corrections: dict[tuple[int, str], str],
+) -> int:
+    from pypdf.generic import (
+        ArrayObject,
+        DecodedStreamObject,
+        DictionaryObject,
+        NameObject,
+    )
+
+    if not lines:
+        return 0
+    resources_value = page.get("/Resources")
+    resources = resources_value.get_object() if resources_value else DictionaryObject()
+    if not isinstance(resources, DictionaryObject):
+        resources = DictionaryObject()
+    fonts_value = resources.get("/Font")
+    fonts = fonts_value.get_object() if fonts_value else DictionaryObject()
+    if not isinstance(fonts, DictionaryObject):
+        fonts = DictionaryObject()
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+            NameObject("/Encoding"): NameObject("/WinAnsiEncoding"),
+        }
+    )
+    fonts[NameObject("/AIOrganizerOCR")] = writer._add_object(font)
+    resources[NameObject("/Font")] = fonts
+    page[NameObject("/Resources")] = resources
+    width = float(page.mediabox.width)
+    height = float(page.mediabox.height)
+    left_offset = float(page.mediabox.left)
+    bottom_offset = float(page.mediabox.bottom)
+    commands = ["q", "BT", "3 Tr"]
+    accepted = 0
+    for line_number, line in enumerate(lines):
+        raw_bounds = line.get("bounds", ())
+        if not isinstance(raw_bounds, (list, tuple)) or len(raw_bounds) != 4:
+            continue
+        x, top, box_width, box_height = (float(value) for value in raw_bounds)
+        if box_width <= 0 or box_height <= 0:
+            continue
+        line_id = str(line.get("line_id", f"line-{line_number:04d}"))
+        original_text = str(line.get("text", "")).strip()
+        text = corrections.get((page_index, line_id), original_text).strip()
+        if not text:
+            continue
+        positioned_words = _corrected_positioned_words(line, original_text, text)
+        if positioned_words:
+            for word_text, word_bounds in positioned_words:
+                _append_invisible_text_command(
+                    commands,
+                    word_text,
+                    word_bounds,
+                    width,
+                    height,
+                    left_offset,
+                    bottom_offset,
+                )
+        else:
+            _append_invisible_text_command(
+                commands,
+                text,
+                (x, top, box_width, box_height),
+                width,
+                height,
+                left_offset,
+                bottom_offset,
+            )
+        accepted += 1
+    commands.extend(["ET", "Q"])
+    if not accepted:
+        return 0
+    stream = DecodedStreamObject()
+    stream.set_data(("\n".join(commands) + "\n").encode("ascii"))
+    stream_ref = writer._add_object(stream)
+    contents = page.get("/Contents")
+    if contents is None:
+        page[NameObject("/Contents")] = stream_ref
+    elif isinstance(contents, ArrayObject):
+        contents.append(stream_ref)
+    else:
+        page[NameObject("/Contents")] = ArrayObject([contents, stream_ref])
+    return accepted
+
+
+def _corrected_positioned_words(
+    line: dict[str, Any], original_text: str, corrected_text: str
+) -> list[tuple[str, tuple[float, float, float, float]]]:
+    """Map same-length line corrections back onto Tesseract's original word boxes."""
+    raw_words = [value for value in line.get("words", []) if isinstance(value, dict)]
+    if not raw_words or len(original_text) != len(corrected_text):
+        return []
+    original_words = [str(value.get("text", "")) for value in raw_words]
+    if " ".join(original_words) != original_text:
+        return []
+    positioned: list[tuple[str, tuple[float, float, float, float]]] = []
+    offset = 0
+    for raw_word, original_word in zip(raw_words, original_words, strict=True):
+        raw_bounds = raw_word.get("bounds", ())
+        if not isinstance(raw_bounds, (list, tuple)) or len(raw_bounds) != 4:
+            return []
+        bounds = (
+            float(raw_bounds[0]),
+            float(raw_bounds[1]),
+            float(raw_bounds[2]),
+            float(raw_bounds[3]),
+        )
+        word = corrected_text[offset : offset + len(original_word)]
+        positioned.append((word, bounds))
+        offset += len(original_word) + 1
+    return positioned
+
+
+def _append_invisible_text_command(
+    commands: list[str],
+    text: str,
+    bounds: tuple[float, float, float, float],
+    page_width: float,
+    page_height: float,
+    left_offset: float,
+    bottom_offset: float,
+) -> None:
+    x, top, box_width, box_height = bounds
+    font_size = max(3.0, min(72.0, box_height * page_height * 0.82))
+    estimated_width = max(1.0, len(text) * font_size * 0.5)
+    horizontal_scale = max(10.0, min(500.0, box_width * page_width / estimated_width * 100))
+    pdf_x = left_offset + x * page_width
+    pdf_y = bottom_offset + page_height - (top + box_height) * page_height
+    commands.extend(
+        [
+            f"/AIOrganizerOCR {font_size:.4f} Tf",
+            f"{horizontal_scale:.4f} Tz",
+            f"1 0 0 1 {pdf_x:.4f} {pdf_y:.4f} Tm",
+            f"({_pdf_literal(text)}) Tj",
+        ]
+    )
+
+
+def _pdf_literal(text: str) -> str:
+    encoded = text.encode("cp1252", errors="replace").decode("latin-1")
+    return (
+        encoded.replace("\\", "\\\\")
+        .replace("(", "\\(")
+        .replace(")", "\\)")
+        .replace("\r", " ")
+        .replace("\n", " ")
     )
 
 

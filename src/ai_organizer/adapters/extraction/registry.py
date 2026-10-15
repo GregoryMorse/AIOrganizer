@@ -61,6 +61,7 @@ class _PdfTextPage(Protocol):
 
 class PdfExtractor:
     name = "pypdf"
+    VERSION = "5"
 
     def __init__(self, ocr: QtPdfOcr | None = None) -> None:
         self.ocr = ocr
@@ -76,7 +77,21 @@ class PdfExtractor:
             encrypted = bool(reader.is_encrypted)
             page_count = None if encrypted else len(reader.pages)
             page_objects = [] if encrypted else list(reader.pages[:50])
-            pages = [] if encrypted else [_extract_pdf_page_text(page) for page in page_objects]
+            qt_pages = _extract_qt_pdf_pages(path, len(page_objects)) if not encrypted else []
+            extracted_pages = (
+                []
+                if encrypted
+                else [
+                    _extract_pdf_page_text_with_mode(
+                        page,
+                        qt_pages[index] if index < len(qt_pages) else "",
+                    )
+                    for index, page in enumerate(page_objects)
+                ]
+            )
+            pages = [value[0] for value in extracted_pages]
+            extraction_modes = [value[1] for value in extracted_pages]
+            spacing_disagreements = [value[2] for value in extracted_pages]
             document_metadata = {
                 str(key): str(value) for key, value in (reader.metadata or {}).items()
             }
@@ -109,6 +124,8 @@ class PdfExtractor:
                     if page_text.strip()
                     else "image-backed page has no embedded text"
                 )
+            if spacing_disagreements[index] >= 12:
+                reasons.append("embedded text engines disagree on multiple word boundaries")
             if quality_reasons:
                 reasons.extend(quality_reasons)
             if reasons:
@@ -119,6 +136,8 @@ class PdfExtractor:
         ocr_used = False
         ocr_available = bool(self.ocr and self.ocr.available())
         ocr_layout_pages: dict[str, object] = {}
+        ocr_no_text_pages: list[int] = []
+        ocr_failed_pages: list[int] = []
         if ocr_candidates and self.ocr and ocr_available:
             recognized_layout = self.ocr.recognize_pages_with_layout(path, ocr_candidates)
             for page_index, layout in recognized_layout.items():
@@ -130,12 +149,17 @@ class PdfExtractor:
                     pages[page_index] = ocr_text[:100_000]
                     page_coverage[page_index] = min(0.85, len(ocr_text.strip()) / 800)
                     ocr_layout_pages[str(page_index)] = layout
+                elif layout.get("ocr_status") == "no_recognizable_text":
+                    ocr_no_text_pages.append(page_index)
+                else:
+                    ocr_failed_pages.append(page_index)
             if ocr_layout_pages:
                 ocr_used = True
             text = "\n".join(pages)[:MAX_TEXT_BYTES]
             coverage = sum(page_coverage) / max(1, len(page_coverage))
         completed_ocr = sorted(int(value) for value in ocr_layout_pages)
-        remaining_ocr = [index for index in ocr_candidates if index not in completed_ocr]
+        resolved_ocr = {*completed_ocr, *ocr_no_text_pages}
+        remaining_ocr = [index for index in ocr_candidates if index not in resolved_ocr]
         ai_cleanup_pages, ai_cleanup_reasons = _ocr_cleanup_assessment(ocr_layout_pages)
         route = _confidence_route(
             coverage,
@@ -159,6 +183,8 @@ class PdfExtractor:
                 "ocr_candidate_pages": ocr_candidates,
                 "ocr_candidate_reasons": ocr_reasons,
                 "ocr_completed_pages": completed_ocr,
+                "ocr_no_text_pages": sorted(ocr_no_text_pages),
+                "ocr_failed_pages": sorted(ocr_failed_pages),
                 "ocr_remaining_pages": remaining_ocr,
                 "ocr_available": ocr_available,
                 "ocr_availability": (
@@ -174,7 +200,13 @@ class PdfExtractor:
                 "ai_cleanup_recommended": bool(ai_cleanup_pages),
                 "ai_cleanup_pages": ai_cleanup_pages,
                 "ai_cleanup_reasons": ai_cleanup_reasons,
-                "pdf_text_extraction_mode": "layout",
+                "pdf_text_extraction_mode": (
+                    "layout"
+                    if all(value == "layout" for value in extraction_modes)
+                    else "layout_with_local_quality_fallback"
+                ),
+                "pdf_page_text_extraction_modes": extraction_modes,
+                "pdf_page_spacing_disagreements": spacing_disagreements,
                 "metadata": document_metadata,
                 **health,
             },
@@ -183,21 +215,118 @@ class PdfExtractor:
             provenance=self.name,
             confidence_route=route,
             content_classes=["extracted_text"],
-            extractor_version="3",
+            extractor_version=self.VERSION,
         )
 
 
 def _extract_pdf_page_text(page: _PdfTextPage) -> str:
     """Prefer pypdf's position-aware layout reconstruction with a compatibility fallback."""
+    return _extract_pdf_page_text_with_mode(page)[0]
+
+
+def _extract_pdf_page_text_with_mode(page: _PdfTextPage, qt_text: str = "") -> tuple[str, str, int]:
+    """Use plain extraction only when it measurably repairs a damaged layout reconstruction."""
     try:
-        value = page.extract_text(
-            extraction_mode="layout",
-            layout_mode_space_vertically=False,
-            layout_mode_strip_rotated=False,
-        )
+        layout = str(
+            page.extract_text(
+                extraction_mode="layout",
+                layout_mode_space_vertically=False,
+                layout_mode_strip_rotated=False,
+            )
+            or ""
+        )[:100_000]
     except TypeError:
-        value = page.extract_text()
-    return str(value or "")[:100_000]
+        return str(page.extract_text() or "")[:100_000], "plain_compatibility", 0
+    plain = str(page.extract_text() or "")[:100_000]
+    layout_alpha = sum(character.isalpha() for character in layout)
+    candidates = [(layout, "layout", 0)]
+    plain_alpha = sum(character.isalpha() for character in plain)
+    if plain and plain_alpha >= layout_alpha * 0.7:
+        candidates.append((plain, "plain_quality_fallback", 1))
+    text, mode, _priority = min(
+        candidates,
+        key=lambda value: (
+            not bool(value[0].strip()),
+            _text_quality_rank(value[0]),
+            -len(_word_boundary_signature(value[0])),
+            value[2],
+        ),
+    )
+    qt_candidate = qt_text[:100_000]
+    qt_alpha = sum(character.isalpha() for character in qt_candidate)
+    if qt_candidate and qt_alpha >= layout_alpha * 0.7:
+        candidates.append((qt_candidate, "qt_quality_fallback", 2))
+        selected_quality = (not bool(text.strip()), _text_quality_rank(text))
+        qt_quality = (not bool(qt_candidate.strip()), _text_quality_rank(qt_candidate))
+        if qt_quality < selected_quality:
+            text, mode = qt_candidate, "qt_quality_fallback"
+    compact = _compact_alphanumeric(text)
+    selected_boundaries = _word_boundary_signature(text)
+    disagreement = max(
+        (
+            len(selected_boundaries.symmetric_difference(_word_boundary_signature(candidate)))
+            for candidate, _candidate_mode, _candidate_priority in candidates
+            if _compact_alphanumeric(candidate) == compact
+        ),
+        default=0,
+    )
+    return text, mode, disagreement
+
+
+def _compact_alphanumeric(text: str) -> str:
+    return "".join(character.casefold() for character in text if character.isalnum())
+
+
+def _word_boundary_signature(text: str) -> set[int]:
+    """Represent whitespace boundaries by offsets in the alphanumeric character stream."""
+    boundaries: set[int] = set()
+    alphanumeric_offset = 0
+    previous_nonspace = ""
+    for index, character in enumerate(text):
+        if character.isalnum():
+            alphanumeric_offset += 1
+            previous_nonspace = character
+            continue
+        if not character.isspace() or not alphanumeric_offset:
+            if not character.isspace():
+                previous_nonspace = character
+            continue
+        if index and text[index - 1].isspace():
+            continue
+        following_index = index + 1
+        while following_index < len(text) and text[following_index].isspace():
+            following_index += 1
+        following = text[following_index] if following_index < len(text) else ""
+        if previous_nonspace.isalnum() and following.isalnum():
+            boundaries.add(alphanumeric_offset)
+    return boundaries
+
+
+def _extract_qt_pdf_pages(path: Path, page_count: int) -> list[str]:
+    """Extract local renderer text when QtPdf is installed; never performs OCR."""
+    try:
+        from PySide6.QtPdf import QPdfDocument
+    except ImportError:
+        return []
+    document = QPdfDocument()
+    try:
+        if document.load(str(path)) != QPdfDocument.Error.None_:
+            return []
+        return [
+            str(document.getAllText(index).text() or "")[:100_000] for index in range(page_count)
+        ]
+    finally:
+        document.close()
+
+
+def _text_quality_rank(text: str) -> tuple[int, int, int]:
+    alphabetic_runs = re.findall(r"[^\W\d_]+", text, flags=re.UNICODE)
+    long_runs = [token for token in alphabetic_runs if len(token) >= 24]
+    return (
+        len(_text_quality_reasons(text)),
+        len(long_runs),
+        max((len(token) for token in long_runs), default=0),
+    )
 
 
 def _pdf_page_image_count(page: object) -> int:
@@ -220,6 +349,14 @@ def _text_quality_reasons(text: str) -> list[str]:
     separators = sum(character.isspace() for character in value)
     if len(value) >= 80 and alphanumeric >= 60 and separators / max(1, alphanumeric) < 0.015:
         reasons.append("embedded text has implausibly little word spacing")
+    alphabetic_runs = re.findall(r"[^\W\d_]+", value, flags=re.UNICODE)
+    long_runs = [token for token in alphabetic_runs if len(token) >= 24]
+    if long_runs and (
+        len(long_runs) >= 3
+        or max(map(len, long_runs)) >= 40
+        or len(long_runs) / max(1, len(alphabetic_runs)) >= 0.08
+    ):
+        reasons.append("embedded text contains implausibly long joined words")
     return reasons
 
 
@@ -234,13 +371,19 @@ def _ocr_cleanup_assessment(
         reasons: list[str] = []
         lines = [value for value in raw_page.get("lines", []) if isinstance(value, dict)]
         confidences = [float(value.get("confidence", 0.0)) for value in lines]
+        if raw_page.get("ocr_fallback_used"):
+            reasons.append("alternate local OCR page segmentation was required")
         if confidences and sum(confidences) / len(confidences) < 0.88:
             reasons.append("average local OCR confidence is below 88%")
         if any(value < 0.65 for value in confidences):
             reasons.append("one or more OCR lines have very low confidence")
         for line in lines:
-            if _text_quality_reasons(str(line.get("text", ""))):
-                reasons.append("OCR line spacing or character quality looks suspicious")
+            line_text = str(line.get("text", ""))
+            printable = sum(
+                character.isprintable() or character in "\r\n\t" for character in line_text
+            )
+            if "\ufffd" in line_text or printable / max(1, len(line_text)) < 0.97:
+                reasons.append("OCR contains invalid or non-printable characters")
                 break
         if reasons:
             page_index = int(raw_page.get("page_index", page_key))
@@ -591,28 +734,56 @@ class TesseractOcr:
     def recognize_layout(
         self, image: Path, languages: list[str], *, page_index: int = 0
     ) -> dict[str, object]:
-        result = subprocess.run(
-            [
-                self.executable,
-                str(image),
-                "stdout",
-                "-l",
-                "+".join(languages or ["eng"]),
-                "tsv",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=180,
-            env=self.environment,
-        )
         from PIL import Image
 
         with Image.open(image) as rendered:
             width, height = rendered.size
-        return _parse_tesseract_tsv(result.stdout, width, height, page_index)
+        candidates = []
+        for psm in (3, 6, 11):
+            result = subprocess.run(
+                [
+                    self.executable,
+                    str(image),
+                    "stdout",
+                    "-l",
+                    "+".join(languages or ["eng"]),
+                    "--psm",
+                    str(psm),
+                    "tsv",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+                env=self.environment,
+            )
+            layout = _parse_tesseract_tsv(result.stdout, width, height, page_index)
+            lines = [value for value in layout.get("lines", []) if isinstance(value, dict)]
+            word_count = sum(int(line.get("word_count", 0)) for line in lines)
+            confidence = sum(float(line.get("confidence", 0.0)) for line in lines) / max(
+                1, len(lines)
+            )
+            layout["ocr_segmentation_mode"] = psm
+            layout["ocr_fallback_used"] = psm != 3
+            layout["ocr_word_count"] = word_count
+            candidates.append((word_count, confidence, layout))
+            if psm == 3 and word_count >= 3:
+                return layout
+        word_count, confidence, best = max(candidates, key=lambda value: (value[0], value[1]))
+        if word_count >= 3 or (word_count >= 1 and confidence >= 0.75):
+            return best
+        return {
+            "page_index": page_index,
+            "image_width": width,
+            "image_height": height,
+            "coordinate_space": "normalized_top_left",
+            "text": "",
+            "lines": [],
+            "ocr_status": "no_recognizable_text",
+            "ocr_attempted_segmentation_modes": [3, 6, 11],
+        }
 
 
 class QtPdfOcr:
@@ -654,9 +825,9 @@ class QtPdfOcr:
             ]
             for page in allowed:
                 points = document.pagePointSize(page)
-                target_width = max(1, round(points.width() / 72 * 220))
-                target_height = max(1, round(points.height() / 72 * 220))
-                scale = min(1.0, 3200 / max(target_width, target_height))
+                target_width = max(1, round(points.width() / 72 * 300))
+                target_height = max(1, round(points.height() / 72 * 300))
+                scale = min(1.0, 4096 / max(target_width, target_height))
                 render_size = QSize(
                     max(1, round(target_width * scale)),
                     max(1, round(target_height * scale)),
@@ -665,9 +836,18 @@ class QtPdfOcr:
                 image_path = Path(temporary) / f"page-{page:04d}.png"
                 if image.isNull() or not image.save(str(image_path), "PNG"):
                     continue
-                fragments[page] = self.tesseract.recognize_layout(
-                    image_path, ["eng"], page_index=page
-                )
+                try:
+                    fragments[page] = self.tesseract.recognize_layout(
+                        image_path, ["eng"], page_index=page
+                    )
+                except (OSError, subprocess.SubprocessError) as error:
+                    fragments[page] = {
+                        "page_index": page,
+                        "text": "",
+                        "lines": [],
+                        "ocr_status": "failed",
+                        "error_type": type(error).__name__,
+                    }
         document.close()
         return fragments
 

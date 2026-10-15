@@ -13,6 +13,7 @@ class DeviceFlowPrompt:
     user_code: str
     verification_uri: str
     flow: dict[str, Any]
+    verification_uri_complete: str = ""
 
 
 class MsalDeviceAuth:
@@ -27,7 +28,7 @@ class MsalDeviceAuth:
     ) -> None:
         self.client_id = client_id or os.getenv("AIORGANIZER_GRAPH_CLIENT_ID", "")
         if not self.client_id:
-            raise RuntimeError("Set AIORGANIZER_GRAPH_CLIENT_ID before signing in to Outlook")
+            raise RuntimeError("A Microsoft Graph application (client) ID is required")
         self.authority = authority or os.getenv(
             "AIORGANIZER_GRAPH_AUTHORITY", "https://login.microsoftonline.com/common"
         )
@@ -87,11 +88,19 @@ class MsalDeviceAuth:
             str(flow["user_code"]),
             str(flow.get("verification_uri", flow.get("verification_url", ""))),
             flow,
+            str(flow.get("verification_uri_complete", "")),
         )
+
+    @staticmethod
+    def cancel_device_flow(prompt: DeviceFlowPrompt) -> None:
+        prompt.flow["_aiorganizer_cancelled"] = True
+        prompt.flow["expires_at"] = 0
 
     def complete_device_flow(self, prompt: DeviceFlowPrompt) -> dict[str, Any]:
         result = self._app.acquire_token_by_device_flow(prompt.flow)
         self._persist()
+        if prompt.flow.get("_aiorganizer_cancelled"):
+            raise RuntimeError("Microsoft sign-in was cancelled")
         if "access_token" not in result:
             raise RuntimeError(str(result.get("error_description", "Microsoft sign-in failed")))
         return dict(result)

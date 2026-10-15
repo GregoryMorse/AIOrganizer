@@ -11,6 +11,7 @@ from ai_organizer.adapters.extraction.registry import (
     PdfExtractor,
     TesseractOcr,
     _parse_tesseract_tsv,
+    _text_quality_reasons,
 )
 from ai_organizer.adapters.persistence import WorkspaceStore
 from ai_organizer.adapters.providers.base import ProviderError, parse_findings
@@ -159,8 +160,227 @@ def test_pdf_short_vector_text_is_not_mislabeled_as_needing_ocr(
 
     assert evidence.facts["pages"] == ["Short cover title"]
     assert evidence.facts["ocr_candidate_pages"] == []
+    assert evidence.facts["pdf_page_spacing_disagreements"] == [0]
     assert evidence.facts["needs_ocr"] is False
     assert evidence.facts["pdf_text_extraction_mode"] == "layout"
+
+
+def test_pdf_joined_word_runs_are_reocr_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Page:
+        def __init__(self) -> None:
+            self.rotation = 0
+            self.mediabox = [0, 0, 612, 792]
+            self.images: list[object] = []
+
+        def extract_text(self, **_kwargs: object) -> str:
+            return (
+                "EarlywithdrawalpenaltyInterestincome "
+                "Taxableinterestcalculationworksheet "
+                "Accountownershipclassificationdetails"
+            )
+
+    class Reader:
+        def __init__(self, _path: Path, strict: bool = False) -> None:
+            assert strict is False
+            self.is_encrypted = False
+            self.metadata: dict[str, str] = {}
+            self.pages = [Page()]
+
+    monkeypatch.setitem(sys.modules, "pypdf", SimpleNamespace(PdfReader=Reader))
+
+    evidence = PdfExtractor().extract(Path("joined.pdf"), _item("joined", "joined.pdf"))
+
+    assert evidence.facts["ocr_candidate_pages"] == [0]
+    assert (
+        "embedded text contains implausibly long joined words"
+        in evidence.facts["ocr_candidate_reasons"]["0"]
+    )
+    assert evidence.facts["needs_ocr"] is True
+    assert _text_quality_reasons("Short cover title") == []
+
+
+def test_pdf_uses_cleaner_plain_text_when_layout_reconstruction_joins_words(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Page:
+        def __init__(self) -> None:
+            self.rotation = 0
+            self.mediabox = [0, 0, 612, 792]
+            self.images: list[object] = []
+
+        def extract_text(self, **kwargs: object) -> str:
+            if kwargs.get("extraction_mode") == "layout":
+                return (
+                    "EarlywithdrawalpenaltyInterestincome "
+                    "Taxableinterestcalculationworksheet "
+                    "Accountownershipclassificationdetails"
+                )
+            return (
+                "Early withdrawal penalty Interest income Taxable interest calculation worksheet "
+                "Account ownership classification details"
+            )
+
+    class Reader:
+        def __init__(self, _path: Path, strict: bool = False) -> None:
+            assert strict is False
+            self.is_encrypted = False
+            self.metadata: dict[str, str] = {}
+            self.pages = [Page()]
+
+    monkeypatch.setitem(sys.modules, "pypdf", SimpleNamespace(PdfReader=Reader))
+
+    evidence = PdfExtractor().extract(Path("fallback.pdf"), _item("fallback", "fallback.pdf"))
+
+    assert evidence.facts["pages"] == [
+        "Early withdrawal penalty Interest income Taxable interest calculation worksheet "
+        "Account ownership classification details"
+    ]
+    assert evidence.facts["pdf_page_text_extraction_modes"] == ["plain_quality_fallback"]
+    assert evidence.facts["pdf_text_extraction_mode"] == "layout_with_local_quality_fallback"
+    assert evidence.facts["ocr_candidate_pages"] == []
+    assert evidence.facts["pdf_page_spacing_disagreements"][0] < 12
+
+
+def test_pdf_prefers_qt_renderer_text_when_it_repairs_joined_words(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Page:
+        def __init__(self) -> None:
+            self.rotation = 0
+            self.mediabox = [0, 0, 612, 792]
+            self.images: list[object] = []
+
+        def extract_text(self, **kwargs: object) -> str:
+            if kwargs.get("extraction_mode") == "layout":
+                return (
+                    "EarlywithdrawalpenaltyInterestincome "
+                    "Taxableinterestcalculationworksheet "
+                    "Accountownershipclassificationdetails"
+                )
+            return (
+                "Earlywithdrawalpenalty Interestincome Taxableinterestcalculation worksheet "
+                "Accountownershipclassification details"
+            )
+
+    class Reader:
+        def __init__(self, _path: Path, strict: bool = False) -> None:
+            assert strict is False
+            self.is_encrypted = False
+            self.metadata: dict[str, str] = {}
+            self.pages = [Page()]
+
+    qt_text = (
+        "Early withdrawal penalty Interest income Taxable interest calculation worksheet "
+        "Account ownership classification details"
+    )
+    monkeypatch.setitem(sys.modules, "pypdf", SimpleNamespace(PdfReader=Reader))
+    monkeypatch.setattr(
+        "ai_organizer.adapters.extraction.registry._extract_qt_pdf_pages",
+        lambda _path, _count: [qt_text],
+    )
+
+    evidence = PdfExtractor().extract(Path("qt-fallback.pdf"), _item("qt", "qt-fallback.pdf"))
+
+    assert evidence.facts["pages"] == [qt_text]
+    assert evidence.facts["pdf_page_text_extraction_modes"] == ["qt_quality_fallback"]
+    assert evidence.extractor_version == PdfExtractor.VERSION
+    assert evidence.facts["ocr_candidate_pages"] == []
+    assert evidence.facts["pdf_page_spacing_disagreements"][0] < 12
+
+
+def test_pdf_flags_short_word_boundary_disagreement_for_local_ocr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    joined = (
+        "customerwecontinue appreciateif managementandstaff havethe askfor approachis "
+        "standardin manyqualities amountwill wecanbetter"
+    )
+    spaced = (
+        "customer we continue appreciate if management and staff have the ask for approach is "
+        "standard in many qualities amount will we can better"
+    )
+
+    class Page:
+        def __init__(self) -> None:
+            self.rotation = 0
+            self.mediabox = [0, 0, 612, 792]
+            self.images: list[object] = []
+
+        def extract_text(self, **kwargs: object) -> str:
+            return joined if kwargs.get("extraction_mode") == "layout" else spaced
+
+    class Reader:
+        def __init__(self, _path: Path, strict: bool = False) -> None:
+            assert strict is False
+            self.is_encrypted = False
+            self.metadata: dict[str, str] = {}
+            self.pages = [Page()]
+
+    monkeypatch.setitem(sys.modules, "pypdf", SimpleNamespace(PdfReader=Reader))
+    monkeypatch.setattr(
+        "ai_organizer.adapters.extraction.registry._extract_qt_pdf_pages",
+        lambda _path, _count: [joined],
+    )
+
+    evidence = PdfExtractor().extract(Path("spacing.pdf"), _item("spacing", "spacing.pdf"))
+
+    assert evidence.facts["pages"] == [spaced]
+    assert evidence.facts["pdf_page_text_extraction_modes"] == ["plain_quality_fallback"]
+    assert evidence.facts["ocr_candidate_pages"] == [0]
+    assert evidence.facts["ocr_candidate_reasons"]["0"] == [
+        "embedded text engines disagree on multiple word boundaries"
+    ]
+
+
+def test_pdf_no_recognizable_text_is_resolved_not_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ImageCollection:
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            yield object()
+
+    class Page:
+        def __init__(self) -> None:
+            self.rotation = 0
+            self.mediabox = [0, 0, 612, 792]
+            self.images = ImageCollection()
+
+        def extract_text(self, **_kwargs: object) -> str:
+            return ""
+
+    class Reader:
+        def __init__(self, _path: Path, strict: bool = False) -> None:
+            assert strict is False
+            self.is_encrypted = False
+            self.metadata: dict[str, str] = {}
+            self.pages = [Page()]
+
+    class Ocr:
+        def available(self) -> bool:
+            return True
+
+        def recognize_pages_with_layout(
+            self, _path: Path, pages: list[int]
+        ) -> dict[int, dict[str, object]]:
+            return {
+                pages[0]: {
+                    "page_index": pages[0],
+                    "text": "",
+                    "lines": [],
+                    "ocr_status": "no_recognizable_text",
+                }
+            }
+
+    monkeypatch.setitem(sys.modules, "pypdf", SimpleNamespace(PdfReader=Reader))
+
+    evidence = PdfExtractor(Ocr()).extract(  # type: ignore[arg-type]
+        Path("blank.pdf"), _item("blank", "blank.pdf")
+    )
+
+    assert evidence.facts["ocr_no_text_pages"] == [0]
+    assert evidence.facts["ocr_failed_pages"] == []
+    assert evidence.facts["ocr_remaining_pages"] == []
+    assert evidence.facts["needs_ocr"] is False
 
 
 @pytest.mark.parametrize("version_line", ["tesseract 5.5.2", "tesseract v5.5.0.20241111"])
@@ -193,6 +413,59 @@ def test_tesseract_tsv_preserves_normalized_line_positions() -> None:
     assert lines[0]["bounds"] == [0.1, 0.1, 0.25, 0.015]
     assert lines[0]["words"][1]["bounds"] == [0.19, 0.1, 0.16, 0.015]
     assert lines[1]["line_id"] == "b001-p001-l002"
+
+
+def test_tesseract_layout_retries_alternate_segmentation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PIL import Image
+
+    image = tmp_path / "page.png"
+    Image.new("RGB", (100, 100), "white").save(image)
+    header = (
+        "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\t"
+        "height\tconf\ttext\n"
+    )
+    recovered = header + (
+        "5\t1\t1\t1\t1\t1\t10\t10\t20\t10\t80\tOne\n"
+        "5\t1\t1\t1\t1\t2\t35\t10\t20\t10\t82\ttwo\n"
+        "5\t1\t1\t1\t1\t3\t60\t10\t25\t10\t84\tthree\n"
+    )
+
+    def run(command, **_kwargs):  # type: ignore[no-untyped-def]
+        psm = command[command.index("--psm") + 1]
+        return SimpleNamespace(stdout=recovered if psm == "6" else header)
+
+    monkeypatch.setattr("ai_organizer.adapters.extraction.registry.subprocess.run", run)
+
+    layout = TesseractOcr("tesseract-test").recognize_layout(image, ["eng"], page_index=4)
+
+    assert layout["text"] == "One two three"
+    assert layout["ocr_segmentation_mode"] == 6
+    assert layout["ocr_fallback_used"] is True
+    assert layout["ocr_word_count"] == 3
+
+
+def test_tesseract_layout_reports_no_reliable_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PIL import Image
+
+    image = tmp_path / "blank.png"
+    Image.new("RGB", (100, 100), "white").save(image)
+    header = (
+        "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\t"
+        "height\tconf\ttext\n"
+    )
+    monkeypatch.setattr(
+        "ai_organizer.adapters.extraction.registry.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=header),
+    )
+
+    layout = TesseractOcr("tesseract-test").recognize_layout(image, ["eng"])
+
+    assert layout["ocr_status"] == "no_recognizable_text"
+    assert layout["lines"] == []
 
 
 def test_provider_privacy_preview_uses_content_class_thresholds(tmp_path: Path) -> None:

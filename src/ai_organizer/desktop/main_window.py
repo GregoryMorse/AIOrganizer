@@ -37,6 +37,7 @@ from .pages import (
     SystemPage,
     UpdatesPage,
 )
+from .table_views import configure_data_list
 
 
 class MainWindow(QMainWindow):
@@ -52,6 +53,7 @@ class MainWindow(QMainWindow):
         self.navigation.setFixedWidth(210)
         self.navigation.setAccessibleName("Application sections")
         self.navigation.setToolTip("Use Up and Down arrows to move between application sections")
+        configure_data_list(self.navigation)
         self.stack = QStackedWidget()
         self.file_pages = [
             ("Overview", OverviewPage(self.controller), True),
@@ -183,6 +185,18 @@ class MainWindow(QMainWindow):
                     else None
                 )
             )
+        self.mailbox_menu = self.menuBar().addMenu("&Mailbox")
+        connect_mailbox = QAction("Connect another Outlook mailbox…", self)
+        connect_mailbox.triggered.connect(self.connect_another_mailbox)
+        self.mailbox_menu.addAction(connect_mailbox)
+        self.select_mailbox_menu = self.mailbox_menu.addMenu("Select active mailbox")
+        self.select_mailbox_menu.aboutToShow.connect(self._refresh_mailbox_menu)
+        manage_mailboxes = QAction("Manage configured mailboxes…", self)
+        manage_mailboxes.triggered.connect(self.manage_mailboxes)
+        self.mailbox_menu.addAction(manage_mailboxes)
+        self.mailbox_menu.aboutToShow.connect(self._refresh_mailbox_menu)
+        self.controller.workspace_changed.connect(self._refresh_mailbox_menu)
+        self.controller.mail_account_changed.connect(self._refresh_mailbox_menu)
         help_menu = self.menuBar().addMenu("&Help")
         welcome = QAction("Welcome and safety tour…", self)
         welcome.triggered.connect(self.show_onboarding)
@@ -229,6 +243,70 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("AIOrganizer")
         self.navigation.setCurrentRow(0)
         self.navigation.blockSignals(False)
+        self.mailbox_menu.menuAction().setVisible(mode == "mail")
+        self._refresh_mailbox_menu()
+
+    def _refresh_mailbox_menu(self) -> None:
+        if not hasattr(self, "select_mailbox_menu"):
+            return
+        self.select_mailbox_menu.clear()
+        self.mailbox_action_group = QActionGroup(self.select_mailbox_menu)
+        self.mailbox_action_group.setExclusive(True)
+        accounts = self.controller.store.list_email_accounts() if self.controller.store else []
+        if not accounts:
+            empty = self.select_mailbox_menu.addAction("No configured mailboxes")
+            empty.setEnabled(False)
+            if getattr(self, "current_mode", "") == "mail":
+                self.setWindowTitle("AIOrganizer — Mail")
+            return
+        active_username = ""
+        for account in accounts:
+            username = str(account.get("username", ""))
+            display_name = str(account.get("display_name", ""))
+            identity = f"{display_name} <{username}>" if display_name != username else username
+            provider = (
+                "Classic Outlook"
+                if account.get("connector_kind") == "classic_outlook"
+                else "Graph"
+            )
+            label = f"{identity} [{provider}]"
+            action = QAction(label, self.select_mailbox_menu)
+            action.setCheckable(True)
+            action.setChecked(bool(account.get("active")))
+            action.setData(str(account["id"]))
+            action.triggered.connect(
+                lambda checked=False, account_id=str(account["id"]): (
+                    self.select_mailbox(account_id) if checked else None
+                )
+            )
+            self.mailbox_action_group.addAction(action)
+            self.select_mailbox_menu.addAction(action)
+            if account.get("active"):
+                active_username = username
+        if getattr(self, "current_mode", "") == "mail":
+            self.setWindowTitle(
+                f"AIOrganizer — Mail — {active_username}" if active_username else "AIOrganizer — Mail"
+            )
+
+    def select_mailbox(self, account_id: str) -> None:
+        try:
+            self.email_page.activate_mailbox(account_id)
+            self._refresh_mailbox_menu()
+        except Exception as error:
+            QMessageBox.critical(self, "Mailbox could not be activated", str(error))
+
+    def connect_another_mailbox(self) -> None:
+        if not self.controller.store:
+            QMessageBox.warning(self, "Workspace required", "Open a workspace first.")
+            return
+        self.set_mode("mail")
+        self.email_page.sign_in()
+        self._refresh_mailbox_menu()
+
+    def manage_mailboxes(self) -> None:
+        self.set_mode("mail")
+        self.navigation.setCurrentRow(3)
+        self.mail_settings_page.show_outlook_settings()
 
     def _navigate(self, row: int) -> None:
         if row < 0:
@@ -406,7 +484,24 @@ class MainWindow(QMainWindow):
                 lambda checked=False, value=str(path): self._open_recent(value)
             )
 
+    def _remove_recent_workspace(self, path: str) -> None:
+        recent = self.settings.value("recentWorkspaces", [], list)
+        values = [value for value in recent if str(value) != path]
+        self.settings.setValue("recentWorkspaces", values)
+        self._refresh_recent_menu()
+
     def _open_recent(self, path: str) -> None:
+        if not Path(path).is_file():
+            answer = QMessageBox.question(
+                self,
+                "Recent workspace is unavailable",
+                f"This workspace no longer exists:\n\n{path}\n\nRemove it from Open recent?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._remove_recent_workspace(path)
+            return
         try:
             self.controller.open_workspace(Path(path))
             self._remember_workspace(path)

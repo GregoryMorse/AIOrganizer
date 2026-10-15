@@ -55,6 +55,7 @@ mcp = [
 email = [
   "keyring>=25,<27",
   "msal>=1.33,<2",
+  "pywin32>=311,<312; sys_platform == 'win32'",
 ]
 dev = [
   "coverage[toml]>=7.10,<8",

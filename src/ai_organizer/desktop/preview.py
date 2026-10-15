@@ -1051,6 +1051,8 @@ class DocumentRepairPreview(FilePreview):
 
 
 def _table(headers: list[str], accessible_name: str) -> QTableWidget:
+    from .table_views import configure_data_table
+
     table = QTableWidget(0, len(headers))
     table.setHorizontalHeaderLabels(headers)
     table.setSortingEnabled(True)
@@ -1060,6 +1062,7 @@ def _table(headers: list[str], accessible_name: str) -> QTableWidget:
     table.setAlternatingRowColors(True)
     table.setAccessibleName(accessible_name)
     table.horizontalHeader().setStretchLastSection(True)
+    configure_data_table(table)
     return table
 
 

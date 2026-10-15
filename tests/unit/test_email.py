@@ -6,8 +6,10 @@ from typing import Any
 import pytest
 
 from ai_organizer.adapters.email import (
+    DeviceFlowPrompt,
     GraphClient,
     GraphResponse,
+    MsalDeviceAuth,
     RemoteConflict,
     UrllibGraphTransport,
 )
@@ -111,6 +113,20 @@ class FakeGraph:
     def create_rule(self, token: str, rule: dict[str, Any]) -> dict[str, Any]:
         del token, rule
         return {"id": "rule-new"}
+
+
+def test_device_flow_can_be_cancelled_cooperatively() -> None:
+    prompt = DeviceFlowPrompt(
+        "Enter the code",
+        "ABCD-EFGH",
+        "https://microsoft.com/devicelogin",
+        {"expires_at": 9999999999},
+    )
+
+    MsalDeviceAuth.cancel_device_flow(prompt)
+
+    assert prompt.flow["expires_at"] == 0
+    assert prompt.flow["_aiorganizer_cancelled"] is True
 
 
 def test_preview_redacts_links_codes_and_tokens() -> None:
@@ -246,6 +262,44 @@ def test_only_one_email_account_can_be_active(tmp_path: Path) -> None:
     store.save_email_account(EmailAccount("two@example.com", "Two", id="two"))
     accounts = store.list_email_accounts()
     assert [value["id"] for value in accounts if value["active"]] == ["two"]
+
+    service = EmailService(store, FakeGraph())  # type: ignore[arg-type]
+    selected = service.activate_account("one")
+
+    assert selected.username == "one@example.com"
+    accounts = store.list_email_accounts()
+    assert [value["id"] for value in accounts if value["active"]] == ["one"]
+    assert {value["id"] for value in accounts} == {"one", "two"}
+    with pytest.raises(ValueError, match="no longer configured"):
+        service.activate_account("missing")
+    store.close()
+
+
+def test_reconnecting_mailbox_updates_existing_account_without_duplicate(tmp_path: Path) -> None:
+    store = WorkspaceStore.create(tmp_path / "reconnect.aioworkspace", "Reconnect")
+    service = EmailService(store, FakeGraph())  # type: ignore[arg-type]
+    profile = {
+        "id": "remote-user",
+        "mail": "person@example.com",
+        "displayName": "Person",
+    }
+
+    first = service.register_active_account(
+        profile,
+        granted_scopes=READ_SCOPES,
+        home_account_id="home.tenant",
+        tenant_id="tenant",
+    )
+    second = service.register_active_account(
+        profile,
+        granted_scopes=(*READ_SCOPES, "Mail.ReadWrite"),
+        home_account_id="home.tenant",
+        tenant_id="tenant",
+    )
+
+    assert first.id == second.id
+    assert len(store.list_email_accounts()) == 1
+    assert "Mail.ReadWrite" in store.list_email_accounts()[0]["granted_scopes"]
     store.close()
 
 
@@ -405,3 +459,63 @@ def test_focused_mail_findings_are_cautious_and_linked_to_messages() -> None:
     )
     assert attachment["message_id"] == "message-1"
     assert "not proof" in attachment["reason"]
+
+
+def test_focused_mail_findings_cover_common_organizational_reviews() -> None:
+    messages = [
+        {
+            "id": "registration",
+            "subject": "Welcome to Example - verify your account",
+            "sender_name": "Example",
+        },
+        {
+            "id": "invoice",
+            "subject": "Invoice 1042 and payment confirmation",
+            "sender_name": "Merchant",
+        },
+        {
+            "id": "renewal",
+            "subject": "Your annual subscription renewal is due",
+            "sender_name": "Service",
+        },
+        {
+            "id": "security",
+            "subject": "Security alert: new sign-in",
+            "sender_name": "Account service",
+        },
+        {
+            "id": "urgent",
+            "subject": "Please reply when convenient",
+            "importance": "high",
+            "sender_name": "Colleague",
+        },
+    ]
+
+    findings = focused_mail_findings(messages, [], [])
+
+    by_message = {
+        (str(value["message_id"]), str(value["kind"])): value for value in findings
+    }
+    assert ("registration", "registration_data") in by_message
+    assert ("invoice", "invoice_or_receipt") in by_message
+    assert ("renewal", "renewal_or_subscription") in by_message
+    assert ("security", "security_or_account_change") in by_message
+    assert ("urgent", "forgotten_task") in by_message
+    assert by_message[("invoice", "invoice_or_receipt")]["sender"] == "Merchant"
+
+    invoice_findings = focused_mail_findings(
+        messages,
+        [
+            {
+                "id": "receipt-file",
+                "message_id": "invoice",
+                "filename": "Receipt-1042.pdf",
+                "is_inline": False,
+            }
+        ],
+        [],
+        included_kinds={"invoice_or_receipt"},
+    )
+
+    assert {value["kind"] for value in invoice_findings} == {"invoice_or_receipt"}
+    assert any(value.get("attachment_id") == "receipt-file" for value in invoice_findings)

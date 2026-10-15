@@ -29,6 +29,11 @@ class EmailProposalStatus(StrEnum):
     COMPLETED = "completed"
 
 
+class EmailConnectorKind(StrEnum):
+    MICROSOFT_GRAPH = "microsoft_graph"
+    CLASSIC_OUTLOOK = "classic_outlook"
+
+
 @dataclass(slots=True)
 class EmailAccount:
     username: str
@@ -40,6 +45,8 @@ class EmailAccount:
     id: str = field(default_factory=lambda: new_id("email_account"))
     revision: int = 1
     updated_at: str = field(default_factory=utc_now)
+    connector_kind: str = EmailConnectorKind.MICROSOFT_GRAPH.value
+    connector_ref: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,19 +209,77 @@ def sanitized_preview(value: str, limit: int = 512) -> str:
 
 
 _TASK_PATTERN = re.compile(
-    r"\b(action required|complete|deadline|due|reminder|respond|review|sign|task|todo|to-do)\b",
+    r"\b(action required|approval required|deadline|due(?: date)?|overdue|reminder|"
+    r"please respond|please review|please sign|urgent|task|todo|to-do)\b",
     re.I,
 )
+_REGISTRATION_PATTERN = re.compile(
+    r"\b(account (?:created|registration)|activate your account|confirm (?:your )?email|"
+    r"complete (?:your )?registration|registration (?:complete|confirmation)|"
+    r"sign[- ]?up (?:complete|confirmation)|verify (?:your )?(?:account|email)|welcome to)\b",
+    re.I,
+)
+_INVOICE_PATTERN = re.compile(
+    r"\b(invoice|receipt|billing statement|order confirmation|payment (?:confirmation|received)|"
+    r"purchase confirmation|tax invoice)\b",
+    re.I,
+)
+_RENEWAL_PATTERN = re.compile(
+    r"\b(auto[- ]?renew|renewal|subscription|membership).{0,24}"
+    r"(?:due|end|ending|expire|expiring|renew|trial)|"
+    r"\b(?:trial|subscription|membership).{0,24}(?:end|ending|expire|expiring|renew)\b",
+    re.I,
+)
+_SECURITY_CHANGE_PATTERN = re.compile(
+    r"\b(account (?:change|changed|recovery|update)|email (?:address )?changed|"
+    r"new sign[- ]?in|password (?:change|changed|reset)|recovery (?:email|phone)|"
+    r"security alert|two[- ]factor|2fa|mfa|unusual activity)\b",
+    re.I,
+)
+
+
+def _message_finding(
+    message: dict[str, Any],
+    kind: str,
+    reason: str,
+    confidence: float,
+) -> dict[str, Any]:
+    message_id = str(message.get("id", ""))
+    return {
+        "id": f"mail-focus:{kind}:{message_id}",
+        "kind": kind,
+        "message_id": message_id,
+        "title": str(message.get("subject", "Untitled message")),
+        "sender": str(message.get("sender_name") or message.get("sender_address", "")),
+        "received_at": str(message.get("received_at", "")),
+        "reason": reason,
+        "confidence": confidence,
+    }
 
 
 def focused_mail_findings(
     messages: list[dict[str, Any]],
     attachments: list[dict[str, Any]],
     security_evidence: list[dict[str, Any]],
+    *,
+    included_kinds: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Find local review candidates without claiming that an action was forgotten."""
     findings: list[dict[str, Any]] = []
     message_ids = {str(value.get("id", "")) for value in messages}
+    message_by_id = {str(value.get("id", "")): value for value in messages}
+
+    def include(kind: str) -> bool:
+        return included_kinds is None or kind in included_kinds
+
+    registration_evidence_message_ids = {
+        str(message_id)
+        for evidence in security_evidence
+        if {str(value) for value in evidence.get("categories", [])}.intersection(
+            {"registration", "welcome", "verification"}
+        )
+        for message_id in evidence.get("message_ids", [])
+    }
     for message in messages:
         message_id = str(message.get("id", ""))
         text = f"{message.get('subject', '')} {message.get('body_preview', '')}"
@@ -223,45 +288,103 @@ def focused_mail_findings(
             "notflagged",
             "complete",
         }
-        if message_id and (flagged or _TASK_PATTERN.search(text)):
+        important = str(message.get("importance", "")).casefold() == "high"
+        if not message_id:
+            continue
+        if include("forgotten_task") and (flagged or important or _TASK_PATTERN.search(text)):
             findings.append(
-                {
-                    "id": f"mail-focus:task:{message_id}",
-                    "kind": "forgotten_task",
-                    "message_id": message_id,
-                    "title": str(message.get("subject", "Untitled message")),
-                    "received_at": str(message.get("received_at", "")),
-                    "reason": (
-                        "The message is flagged or contains task-like wording; verify whether it "
-                        "still needs action."
-                    ),
-                    "confidence": 0.8 if flagged else 0.62,
-                }
+                _message_finding(
+                    message,
+                    "forgotten_task",
+                    "The message is flagged, high importance, or contains task-like wording; "
+                    "verify whether it still needs action.",
+                    0.82 if flagged else (0.75 if important else 0.62),
+                )
+            )
+        if (
+            include("registration_data")
+            and message_id not in registration_evidence_message_ids
+            and _REGISTRATION_PATTERN.search(text)
+        ):
+            findings.append(
+                _message_finding(
+                    message,
+                    "registration_data",
+                    "The cached sender and redacted preview may document an account registration; "
+                    "review it for the account inventory.",
+                    0.76,
+                )
+            )
+        if include("invoice_or_receipt") and _INVOICE_PATTERN.search(text):
+            findings.append(
+                _message_finding(
+                    message,
+                    "invoice_or_receipt",
+                    "Invoice, receipt, order, or payment wording was found in the local mail cache.",
+                    0.74,
+                )
+            )
+        if include("renewal_or_subscription") and _RENEWAL_PATTERN.search(text):
+            findings.append(
+                _message_finding(
+                    message,
+                    "renewal_or_subscription",
+                    "The message may describe a subscription, trial, membership, or renewal date.",
+                    0.68,
+                )
+            )
+        if include("security_or_account_change") and _SECURITY_CHANGE_PATTERN.search(text):
+            findings.append(
+                _message_finding(
+                    message,
+                    "security_or_account_change",
+                    "The message may record a security event or account-detail change; verify it "
+                    "against the account inventory.",
+                    0.76,
+                )
             )
     for evidence in security_evidence:
         categories = {str(value) for value in evidence.get("categories", [])}
-        if not categories.intersection(
-            {"registration", "welcome", "verification", "password_reset", "mfa"}
-        ):
-            continue
         candidates = [
             str(value) for value in evidence.get("message_ids", []) if str(value) in message_ids
         ]
         message_id = candidates[-1] if candidates else ""
-        findings.append(
-            {
-                "id": f"mail-focus:registration:{evidence.get('id', evidence.get('service_key', ''))}",
-                "kind": "registration_data",
-                "message_id": message_id,
-                "title": f"Registration/security evidence for {evidence.get('display_name', '')}",
-                "received_at": str(evidence.get("last_evidence_at", "")),
-                "reason": (
-                    "Cached sender and subject patterns may document an account registration or "
-                    "security setup."
-                ),
-                "confidence": 0.7,
-            }
-        )
+        if include("registration_data") and categories.intersection(
+            {"registration", "welcome", "verification"}
+        ):
+            findings.append(
+                {
+                    "id": f"mail-focus:registration:{evidence.get('id', evidence.get('service_key', ''))}",
+                    "kind": "registration_data",
+                    "message_id": message_id,
+                    "title": f"Registration/account evidence for {evidence.get('display_name', '')}",
+                    "sender": str(evidence.get("display_name", "")),
+                    "received_at": str(evidence.get("last_evidence_at", "")),
+                    "reason": (
+                        "Cached sender and subject patterns may document an account registration; "
+                        "review it for the account inventory."
+                    ),
+                    "confidence": 0.72,
+                }
+            )
+        if include("security_or_account_change") and categories.intersection(
+            {"security_alert", "password_reset", "mfa"}
+        ):
+            findings.append(
+                {
+                    "id": f"mail-focus:security:{evidence.get('id', evidence.get('service_key', ''))}",
+                    "kind": "security_or_account_change",
+                    "message_id": message_id,
+                    "title": f"Security evidence for {evidence.get('display_name', '')}",
+                    "sender": str(evidence.get("display_name", "")),
+                    "received_at": str(evidence.get("last_evidence_at", "")),
+                    "reason": (
+                        "Cached sender and subject patterns may document a security or account "
+                        "change; verify it against the account inventory."
+                    ),
+                    "confidence": 0.72,
+                }
+            )
     for attachment in attachments:
         if attachment.get("is_inline"):
             continue
@@ -269,21 +392,40 @@ def focused_mail_findings(
         message_id = str(attachment.get("message_id", ""))
         if not attachment_id:
             continue
-        findings.append(
-            {
-                "id": f"mail-focus:attachment:{attachment_id}",
-                "kind": "attachment_not_recorded_as_saved",
-                "message_id": message_id,
-                "attachment_id": attachment_id,
-                "title": str(attachment.get("filename", "Attachment")),
-                "received_at": str(attachment.get("received_at", "")),
-                "reason": (
-                    "The mailbox cache contains this attachment, but AIOrganizer has no reviewed "
-                    "record that it was saved. This is a reminder candidate, not proof it is missing."
-                ),
-                "confidence": 0.55,
-            }
-        )
+        filename = str(attachment.get("filename", "Attachment"))
+        if include("attachment_not_recorded_as_saved"):
+            findings.append(
+                {
+                    "id": f"mail-focus:attachment:{attachment_id}",
+                    "kind": "attachment_not_recorded_as_saved",
+                    "message_id": message_id,
+                    "attachment_id": attachment_id,
+                    "title": filename,
+                    "received_at": str(attachment.get("received_at", "")),
+                    "reason": (
+                        "The mailbox cache contains this attachment, but AIOrganizer has no reviewed "
+                        "record that it was saved. This is a reminder candidate, not proof it is missing."
+                    ),
+                    "confidence": 0.55,
+                }
+            )
+        if include("invoice_or_receipt") and _INVOICE_PATTERN.search(filename):
+            message = message_by_id.get(message_id, {})
+            findings.append(
+                {
+                    "id": f"mail-focus:invoice-attachment:{attachment_id}",
+                    "kind": "invoice_or_receipt",
+                    "message_id": message_id,
+                    "attachment_id": attachment_id,
+                    "title": filename,
+                    "sender": str(
+                        message.get("sender_name") or message.get("sender_address", "")
+                    ),
+                    "received_at": str(attachment.get("received_at", "")),
+                    "reason": "The attachment filename suggests an invoice or receipt.",
+                    "confidence": 0.7,
+                }
+            )
     return sorted(
         findings,
         key=lambda value: (str(value.get("received_at", "")), str(value["id"])),

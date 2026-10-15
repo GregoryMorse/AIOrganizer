@@ -9,6 +9,7 @@ from datetime import datetime
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 from PySide6.QtCore import QModelIndex, QProcess, QSettings, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
@@ -42,8 +43,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ai_organizer.adapters.email import GraphClient, MsalDeviceAuth, UrllibGraphTransport
-from ai_organizer.adapters.extraction import default_registry
+from ai_organizer.adapters.email import (
+    ClassicOutlookClient,
+    GraphClient,
+    MsalDeviceAuth,
+    UrllibGraphTransport,
+)
+from ai_organizer.adapters.extraction import PdfExtractor, default_registry
 from ai_organizer.adapters.persistence import WorkspaceCache
 from ai_organizer.adapters.providers import (
     AnthropicProvider,
@@ -64,6 +70,8 @@ from ai_organizer.application.email_service import EmailService
 from ai_organizer.application.inventory_query import InventoryQueryService
 from ai_organizer.application.pdf_repair import (
     PdfRepairAnalyzer,
+    build_searchable_pdf,
+    commit_repaired_pdf,
     positioned_text,
     prepare_ocr_line_corrections,
     restore_ocr_line_corrections,
@@ -82,6 +90,7 @@ from ai_organizer.domain.email import (
     MAIL_WRITE_SCOPES,
     READ_SCOPES,
     RULE_WRITE_SCOPES,
+    EmailConnectorKind,
     EmailProposal,
     EmailProposalKind,
     focused_mail_findings,
@@ -123,6 +132,7 @@ from .preferences import apply_runtime_preferences
 from .preview import DocumentRepairPreview, FilePreview
 from .table_models import DictTableModel
 from .table_views import (
+    configure_data_list,
     configure_data_table,
     configure_data_tree,
     install_table_context_menu,
@@ -166,6 +176,63 @@ def _evidence_text(record: dict[str, Any]) -> str:
         return text
     pages = facts.get("pages", [])
     return "\n\n".join(str(value) for value in pages) if isinstance(pages, list) else ""
+
+
+def _outlook_auth_configuration(
+    settings: QSettings | None = None,
+) -> tuple[str, str, str]:
+    """Resolve an in-app Outlook binding before optional deployment overrides."""
+    settings = settings or QSettings("AIOrganizer", "AIOrganizer")
+    stored_client_id = str(settings.value("outlook/clientId", "") or "").strip()
+    if stored_client_id:
+        tenant = str(settings.value("outlook/tenant", "common") or "common").strip()
+        return (
+            stored_client_id,
+            f"https://login.microsoftonline.com/{tenant or 'common'}",
+            "in-app settings",
+        )
+    environment_client_id = os.getenv("AIORGANIZER_GRAPH_CLIENT_ID", "").strip()
+    authority = os.getenv(
+        "AIORGANIZER_GRAPH_AUTHORITY", "https://login.microsoftonline.com/common"
+    ).strip()
+    return environment_client_id, authority, "deployment environment" if environment_client_id else ""
+
+
+def _mail_connector_label(kind: str) -> str:
+    if kind == EmailConnectorKind.CLASSIC_OUTLOOK.value:
+        return "Classic Outlook (local)"
+    return "Microsoft Graph"
+
+
+def _local_pdf_preview_text(
+    controller: WorkspaceController,
+    item: dict[str, Any],
+    path: Path,
+) -> str:
+    """Return cached PDF text or run the shared local non-OCR extractor on demand."""
+    item_id = str(item.get("id", ""))
+    records = (
+        controller.store.list_evidence_payloads({item_id}, limit=25)["evidence"]
+        if controller.store and item_id
+        else []
+    )
+    current = next(
+        (
+            value
+            for value in records
+            if str(value.get("kind", "")) == "pdf"
+            and str(value.get("extractor_version", "")) == str(PdfExtractor.VERSION)
+        ),
+        None,
+    )
+    if current is not None:
+        return _evidence_text(current)
+    cached = _cached_evidence(controller.store, item_id)
+    if not controller.store or item.get("is_placeholder") or not path.is_file():
+        return _evidence_text(cached)
+    evidence = PdfExtractor().extract(path, _snapshot_from_inventory(item))
+    controller.store.save_evidence(evidence)
+    return _evidence_text({"facts": evidence.facts})
 
 
 def _positioned_layout_text(layout_pages: dict[str, Any]) -> str:
@@ -336,6 +403,7 @@ def _configure_compact_checklist(widget: QListWidget) -> QListWidget:
     widget.setProperty("compactChecklist", True)
     widget.setUniformItemSizes(True)
     widget.setSpacing(0)
+    configure_data_list(widget)
     return widget
 
 
@@ -478,7 +546,8 @@ def _run_inventory_scan(
     parent: QWidget,
     *,
     revalidation: bool = False,
-) -> None:
+    source_ids: set[str] | None = None,
+) -> int | None:
     if not controller.store:
         QMessageBox.warning(parent, "Workspace required", "Open a workspace first.")
         return
@@ -494,21 +563,27 @@ def _run_inventory_scan(
             exclusions=list(source.exclusions),
         )
         for source in controller.sources.values()
+        if source_ids is None or source.id in source_ids
     )
+    if not sources:
+        QMessageBox.information(parent, "No matching sources", "No affected source is available.")
+        return None
     cached = controller.store.metadata_cache_records()
     dialog = InventoryScanDialog(sources, cached, controller.metadata_fingerprint_mode(), parent)
     dialog.start()
     if dialog.error_message:
         QMessageBox.critical(parent, "Inventory failed", dialog.error_message)
-        return
+        return None
     if dialog.result_value is None:
-        return
+        return None
     try:
         count = controller.apply_inventory_scan(dialog.result_value)
         title = "Metadata cache revalidated" if revalidation else "Inventory complete"
         QMessageBox.information(parent, title, f"Recorded {count:,} item(s).")
+        return count
     except Exception as error:
         QMessageBox.critical(parent, "Inventory could not be saved", str(error))
+        return None
 
 
 class ReproposalDialog(QDialog):
@@ -1504,6 +1579,7 @@ class InventoryPage(QWidget):
         self.table.setModel(self.model)
         configure_data_table(self.table)
         self.table.selectionModel().currentChanged.connect(self.preview)
+        self.table.clicked.connect(lambda index: self.preview(index, QModelIndex()))
         self.table.selectionModel().selectionChanged.connect(self.record_selection)
         install_table_context_menu(self.table, self._inventory_context_actions)
         splitter.addWidget(self.table)
@@ -1690,6 +1766,11 @@ class InventoryPage(QWidget):
             placeholder=bool(row.get("is_placeholder")),
             metadata=metadata,
             record=row,
+            extracted_text=(
+                _local_pdf_preview_text(self.controller, row, path)
+                if path.suffix.casefold() == ".pdf"
+                else None
+            ),
         )
 
 
@@ -3005,7 +3086,8 @@ class DocumentRepairPage(QWidget):
         layout.addWidget(title)
         description = QLabel(
             "PDF repair is deliberately separate from Rename. First find candidates, then build "
-            "local OCR and image-compression previews. Sources are never overwritten."
+            "local OCR and image-compression previews. Sources change only after an explicit "
+            "commit; signed originals always remain untouched."
         )
         description.setWordWrap(True)
         layout.addWidget(description)
@@ -3032,14 +3114,22 @@ class DocumentRepairPage(QWidget):
         propose.clicked.connect(self.build_selected_previews)
         correct_ocr = QPushButton("AI-clean selected OCR text")
         correct_ocr.clicked.connect(self.ai_cleanup_selected)
+        self.commit_choice = QComboBox()
+        self.commit_choice.addItem("Accept OCR", "ocr")
+        self.commit_choice.addItem("Accept compression", "compression")
+        self.commit_choice.addItem("Accept both", "both")
+        commit = QPushButton("Commit selected repair…")
+        commit.clicked.connect(self.commit_selected)
         controls.addWidget(discover)
         controls.addWidget(propose)
         controls.addWidget(correct_ocr)
+        controls.addWidget(self.commit_choice)
+        controls.addWidget(commit)
         controls.addStretch()
         layout.addLayout(controls)
         self.model = DictTableModel(
             [
-                ("selected", "Build preview"),
+                ("selected", "Selected"),
                 ("name", "PDF"),
                 ("pages", "Pages"),
                 ("local_ocr", "Local OCR"),
@@ -3064,6 +3154,7 @@ class DocumentRepairPage(QWidget):
         layout.addWidget(splitter, 1)
         self.table.selectionModel().currentChanged.connect(self.preview_selection)
         controller.workspace_changed.connect(self._workspace_changed)
+        controller.inventory_changed.connect(self._workspace_changed)
 
     def _workspace_changed(self) -> None:
         self.model.set_rows([])
@@ -3143,6 +3234,8 @@ class DocumentRepairPage(QWidget):
                         "_compression_path": None,
                         "_compression_summary": assessment.reason,
                         "_ocr_corrections": [],
+                        "_embedded_pages": list(evidence.facts.get("embedded_pages", [])),
+                        "_ocr_no_text_pages": [],
                         "_local_ocr_text": "",
                         "_proposed_ocr_text": "",
                     }
@@ -3195,14 +3288,30 @@ class DocumentRepairPage(QWidget):
                 candidate_pages = list(evidence.facts.get("ocr_candidate_pages", []))
                 completed_pages = list(evidence.facts.get("ocr_completed_pages", []))
                 remaining_pages = list(evidence.facts.get("ocr_remaining_pages", []))
+                no_text_pages = list(evidence.facts.get("ocr_no_text_pages", []))
+                failed_pages = list(evidence.facts.get("ocr_failed_pages", []))
+                row["_embedded_pages"] = list(evidence.facts.get("embedded_pages", []))
+                row["_ocr_no_text_pages"] = no_text_pages
                 if completed_pages and remaining_pages:
                     row["local_ocr"] = (
                         f"partial: {len(completed_pages)}/{len(candidate_pages)} page(s)"
                     )
                 elif completed_pages:
                     row["local_ocr"] = f"completed on {len(completed_pages)} page(s)"
+                    if no_text_pages:
+                        row["local_ocr"] += (
+                            f"; no recognizable text on {len(no_text_pages)} page(s)"
+                        )
+                elif no_text_pages and not remaining_pages:
+                    row["local_ocr"] = f"no recognizable text on {len(no_text_pages)} page(s)"
+                elif failed_pages:
+                    row["local_ocr"] = f"failed on {len(failed_pages)} page(s)"
                 elif candidate_pages:
-                    row["local_ocr"] = "failed or unavailable"
+                    row["local_ocr"] = (
+                        "unavailable"
+                        if not evidence.facts.get("ocr_available")
+                        else "not completed"
+                    )
                 else:
                     row["local_ocr"] = "not indicated"
                 if completed_pages:
@@ -3346,6 +3455,10 @@ class DocumentRepairPage(QWidget):
                         "Preserve every [[AIORGANIZER_PRIVATE_####]] placeholder exactly and in order.",
                         "Use neighboring ordered lines as context, but do not join lines, split lines, "
                         "or change item_id.",
+                        "The suggestion must have exactly the same Unicode character count as the "
+                        "input line and whitespace must remain at exactly the same character indexes.",
+                        "Only substitute misrecognized characters. Never insert or delete characters, "
+                        "words, punctuation, or spaces; return the input unchanged when uncertain.",
                         "Use category 'ocr_correction' and explain uncertain corrections in rationale.",
                     ],
                     "lines": [
@@ -3400,6 +3513,145 @@ class DocumentRepairPage(QWidget):
                 self.preview_selection(current, QModelIndex())
         except Exception as error:
             QMessageBox.critical(self, "AI OCR correction failed safely", str(error))
+
+    def commit_selected(self) -> None:
+        rows = [row for row in self.model.rows if row.get("selected")]
+        if not rows:
+            QMessageBox.information(self, "Nothing selected", "Select repaired PDFs to commit.")
+            return
+        if not self.controller.store:
+            QMessageBox.information(self, "Open a workspace", "Open a workspace first.")
+            return
+        repair_kind = str(self.commit_choice.currentData())
+        if repair_kind not in {"ocr", "compression", "both"}:
+            QMessageBox.critical(self, "Unknown repair choice", "Choose a supported repair commit.")
+            return
+        try:
+            self.controller._validate_selected_inventory(rows)
+            for row in rows:
+                if repair_kind in {"ocr", "both"} and not getattr(
+                    row.get("_evidence"), "facts", {}
+                ).get("ocr_layout_pages"):
+                    raise ValueError(f"{row['name']}: no positioned OCR proposal is available")
+                compression_path = row.get("_compression_path")
+                if repair_kind in {"compression", "both"} and not (
+                    isinstance(compression_path, Path) and compression_path.is_file()
+                ):
+                    raise ValueError(f"{row['name']}: no compression proposal is available")
+        except Exception as error:
+            QMessageBox.critical(self, "Repair preflight failed", str(error))
+            return
+        signed_count = sum(bool(row["_assessment"].digitally_signed) for row in rows)
+        choice_label = self.commit_choice.currentText()
+        answer = QMessageBox.warning(
+            self,
+            "Commit reviewed PDF repair",
+            f"{choice_label} for {len(rows):,} selected PDF(s)?\n\n"
+            "Unsigned PDFs will be atomically replaced after their originals are retained in "
+            ".AIOrganizer-Quarantine. Signed originals are never overwritten and receive a "
+            f"neighbor derivative. Signed originals in this batch: {signed_count:,}.\n\n"
+            "The affected source catalog will be refreshed immediately after the commit.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        store = self.controller.store
+
+        def commit() -> tuple[list[Any], list[str], set[str]]:
+            results = []
+            errors = []
+            affected_sources: set[str] = set()
+            cache = WorkspaceCache(store.workspace_id)
+            for row in rows:
+                try:
+                    root_id = str(row["root_id"])
+                    source_root = self.controller.sources[root_id]
+                    source = source_root.path / str(row["relative_path"])
+                    prepared = row.get("_compression_path") if repair_kind != "ocr" else None
+                    if repair_kind in {"ocr", "both"}:
+                        evidence = row["_evidence"]
+                        fingerprint = f"{source.stat().st_size:x}-{source.stat().st_mtime_ns:x}"
+                        output = cache.artifact_path(
+                            str(row["item_id"]),
+                            fingerprint,
+                            f"searchable-{repair_kind}",
+                            ".pdf",
+                        )
+                        base = row["_compression_path"] if repair_kind == "both" else source
+                        build_searchable_pdf(
+                            Path(base),
+                            output,
+                            dict(evidence.facts.get("ocr_layout_pages", {})),
+                            list(row.get("_ocr_corrections", [])),
+                            list(row.get("_embedded_pages", [])),
+                            raster_dpi=200 if repair_kind == "both" else 300,
+                        )
+                        prepared = output
+                    if not isinstance(prepared, Path):
+                        raise ValueError("Prepared repair PDF is unavailable")
+                    result = commit_repaired_pdf(
+                        source,
+                        prepared,
+                        source_root.path,
+                        str(row["relative_path"]),
+                        digitally_signed=bool(row["_assessment"].digitally_signed),
+                        repair_kind=repair_kind,  # type: ignore[arg-type]
+                    )
+                    results.append(result)
+                    affected_sources.add(root_id)
+                except Exception as error:
+                    errors.append(f"{row['name']}: {error}")
+            return results, errors, affected_sources
+
+        task = BackgroundTaskDialog(
+            "Committing reviewed PDF repairs",
+            "Building final derivatives, validating page geometry, and retaining recoverable originals.",
+            commit,
+            self,
+        )
+        if task.run() != QDialog.DialogCode.Accepted:
+            QMessageBox.critical(
+                self, "PDF repair commit failed safely", task.error_message or "Unknown error"
+            )
+            return
+        results, errors, affected_sources = task.result_value
+        for result in results:
+            store.activity(
+                "pdf_repair.commit",
+                f"Committed {result.repair_kind} repair for {result.source_path.name}",
+                {
+                    "source": str(result.source_path),
+                    "output": str(result.output_path),
+                    "backup": str(result.backup_path) if result.backup_path else "",
+                    "overwritten": result.overwritten,
+                },
+            )
+        self.controller.activity_changed.emit()
+        if results:
+            refreshed = _run_inventory_scan(
+                self.controller,
+                self,
+                revalidation=True,
+                source_ids=affected_sources,
+            )
+            if refreshed is None:
+                QMessageBox.warning(
+                    self,
+                    "Repair committed; catalog refresh incomplete",
+                    "The PDF changes were committed, but the affected source catalog could not be "
+                    "refreshed. Run Inventory before using further proposals.",
+                )
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Some PDF repairs were not committed",
+                "\n".join(errors[:20]),
+            )
+        elif results:
+            self.status.setText(
+                f"Committed {len(results):,} PDF repair(s) and refreshed the affected catalog."
+            )
 
     def preview_selection(self, current: QModelIndex, previous: QModelIndex) -> None:
         row = self.model.row(current)
@@ -5118,6 +5370,7 @@ class ActivityPage(QWidget):
         layout.addWidget(undo)
         self.list = QListWidget()
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        configure_data_list(self.list)
         layout.addWidget(self.list)
         controller.activity_changed.connect(self.refresh)
         controller.workspace_changed.connect(self.refresh)
@@ -5245,7 +5498,7 @@ class SystemPage(QWidget):
         )
         task = BackgroundTaskDialog(
             f"Checking {self.SECTION_LABELS[index].lower()}",
-            "Reading local Windows assessment data. Nothing will be installed or changedâ€¦",
+            "Reading local Windows assessment data. Nothing will be installed or changed…",
             workers[index],
             self,
         )
@@ -5319,7 +5572,7 @@ class SystemPage(QWidget):
             return
         task = BackgroundTaskDialog(
             "Analyzing volume fragmentation",
-            f"Running Windows read-only fragmentation analysis for {letter}:â€¦",
+            f"Running Windows read-only fragmentation analysis for {letter}:…",
             lambda: self.inspector.analyze_fragmentation(letter),
             self,
         )
@@ -5327,7 +5580,7 @@ class SystemPage(QWidget):
             if task.run() != QDialog.DialogCode.Accepted:
                 raise RuntimeError(task.error_message or "Fragmentation analysis did not finish")
             report = str(task.result_value)
-            row["fragmentation_status"] = "Analyzed â€” see details"
+            row["fragmentation_status"] = "Analyzed — see details"
             row["fragmentation_analysis"] = report
             self.models[3].set_rows(self.models[3].rows)
             self.details[3].setPlainText(json.dumps(row, indent=2, ensure_ascii=False))
@@ -5345,6 +5598,7 @@ class SettingsPage(QWidget):
             raise ValueError("Settings mode must be files, mail, or system")
         self.controller = controller
         self.mode = mode
+        self.settings = QSettings("AIOrganizer", "AIOrganizer")
         self.setProperty("settingsMode", mode)
         layout = QVBoxLayout(self)
         title = QLabel("Settings")
@@ -5525,19 +5779,63 @@ class SettingsPage(QWidget):
             outlook_tab = QWidget()
             outlook_layout = QVBoxLayout(outlook_tab)
             outlook_description = QLabel(
-                "Mail mode uses one active delegated Microsoft account. Read-only synchronization "
-                "is requested first; Mail.ReadWrite or MailboxSettings.ReadWrite is requested only "
-                "when applying reviewed folder/message or rule proposals."
+                "Mail mode supports both delegated Microsoft Graph accounts and mail stores from "
+                "Classic Outlook on Windows, with exactly one active mailbox at a time. Graph "
+                "writes retain their reviewed delegated-permission workflow; Classic Outlook is "
+                "currently a read-only local connector."
             )
             outlook_description.setWordWrap(True)
             outlook_layout.addWidget(outlook_description)
-            client_status = QLabel(
-                "Microsoft Graph client ID: configured"
-                if os.getenv("AIORGANIZER_GRAPH_CLIENT_ID")
-                else "Microsoft Graph client ID: not configured"
+            accounts_group = QGroupBox("Configured Outlook mailboxes in this workspace")
+            accounts_layout = QVBoxLayout(accounts_group)
+            self.outlook_accounts = QTreeWidget()
+            self.outlook_accounts.setHeaderLabels(
+                ["Active", "Display name", "Email address", "Connector", "Tenant / access"]
             )
-            client_status.setObjectName("subtleText")
-            outlook_layout.addWidget(client_status)
+            self.outlook_accounts.setSelectionMode(
+                QAbstractItemView.SelectionMode.SingleSelection
+            )
+            configure_data_tree(self.outlook_accounts)
+            accounts_layout.addWidget(self.outlook_accounts)
+            account_controls = QHBoxLayout()
+            activate_account = QPushButton("Make selected mailbox active")
+            activate_account.clicked.connect(self.activate_selected_outlook_account)
+            account_controls.addWidget(activate_account)
+            account_controls.addStretch()
+            accounts_layout.addLayout(account_controls)
+            outlook_layout.addWidget(accounts_group, 1)
+            binding_group = QGroupBox("Microsoft Graph application binding")
+            binding_layout = QFormLayout(binding_group)
+            self.outlook_client_id = QLineEdit()
+            self.outlook_client_id.setPlaceholderText(
+                "Microsoft Entra application (client) ID"
+            )
+            self.outlook_tenant = QLineEdit()
+            self.outlook_tenant.setPlaceholderText("common")
+            binding_layout.addRow("Application (client) ID", self.outlook_client_id)
+            binding_layout.addRow("Tenant ID/domain or audience", self.outlook_tenant)
+            binding_note = QLabel(
+                "Use common for work, school, and personal Microsoft accounts; organizations or "
+                "consumers may be used to restrict the audience, or enter a specific tenant ID/domain. "
+                "The application must be registered as a public/native client with delegated Graph "
+                "permissions and device-code flow enabled."
+            )
+            binding_note.setWordWrap(True)
+            binding_layout.addRow(binding_note)
+            binding_controls = QHBoxLayout()
+            save_binding = QPushButton("Save Outlook binding")
+            save_binding.clicked.connect(self.save_outlook_binding)
+            clear_binding = QPushButton("Remove in-app binding")
+            clear_binding.clicked.connect(self.clear_outlook_binding)
+            binding_controls.addWidget(save_binding)
+            binding_controls.addWidget(clear_binding)
+            binding_controls.addStretch()
+            binding_layout.addRow(binding_controls)
+            outlook_layout.addWidget(binding_group)
+            self.outlook_client_status = QLabel()
+            self.outlook_client_status.setObjectName("subtleText")
+            self.outlook_client_status.setWordWrap(True)
+            outlook_layout.addWidget(self.outlook_client_status)
             permissions = QLabel(
                 "Unavailable operations: sending, replying, forwarding, deletion, permanent "
                 "deletion, and rules that hide mail by marking it read."
@@ -5609,11 +5907,15 @@ class SettingsPage(QWidget):
         controller.workspace_changed.connect(self.refresh_guidance)
         controller.workspace_changed.connect(self.refresh_metadata_settings)
         controller.workspace_changed.connect(self.refresh_folder_depth_policy)
+        controller.workspace_changed.connect(self.refresh_outlook_accounts)
+        controller.mail_account_changed.connect(self.refresh_outlook_accounts)
         controller.prompt_changed.connect(self.refresh_prompt)
         self.refresh_guidance()
         self.refresh_metadata_settings()
         self.refresh_folder_depth_policy()
         self.refresh_accessibility_preferences()
+        self.refresh_outlook_binding()
+        self.refresh_outlook_accounts()
 
     def refresh_guidance(self) -> None:
         self.workspace_guidance.setPlainText(
@@ -5691,15 +5993,142 @@ class SettingsPage(QWidget):
         self.high_contrast.setChecked(settings.value("accessibility/highContrast", False, bool))
 
     def save_accessibility_preferences(self) -> None:
-        settings = QSettings("AIOrganizer", "AIOrganizer")
-        settings.setValue("accessibility/locale", self.interface_locale.currentData())
-        settings.setValue("accessibility/textScale", self.text_scale.value())
-        settings.setValue("accessibility/highContrast", self.high_contrast.isChecked())
+        self.settings.setValue("accessibility/locale", self.interface_locale.currentData())
+        self.settings.setValue("accessibility/textScale", self.text_scale.value())
+        self.settings.setValue("accessibility/highContrast", self.high_contrast.isChecked())
         application = QApplication.instance()
         if application:
-            apply_runtime_preferences(application, settings)
+            apply_runtime_preferences(application, self.settings)
         self.status.setText(
             "Accessibility preferences applied. Restart to apply a changed translation catalog everywhere."
+        )
+
+    def refresh_outlook_binding(self) -> None:
+        if not hasattr(self, "outlook_client_id"):
+            return
+        stored_client_id = str(self.settings.value("outlook/clientId", "") or "").strip()
+        stored_tenant = str(self.settings.value("outlook/tenant", "common") or "common").strip()
+        self.outlook_client_id.setText(stored_client_id)
+        self.outlook_tenant.setText(stored_tenant)
+        client_id, authority, source = _outlook_auth_configuration(self.settings)
+        if client_id:
+            self.outlook_client_status.setText(
+                f"Outlook binding configured from {source}. Authority: {authority}. "
+                "Delegated tokens remain in the operating-system credential store."
+            )
+        else:
+            self.outlook_client_status.setText(
+                "Outlook is not bound yet. Enter the public application ID above; an environment "
+                "variable is not required."
+            )
+
+    def show_outlook_settings(self) -> None:
+        index = next(
+            (
+                value
+                for value in range(self.tabs.count())
+                if self.tabs.tabText(value) == "Outlook & Permissions"
+            ),
+            -1,
+        )
+        if index >= 0:
+            self.tabs.setCurrentIndex(index)
+        self.refresh_outlook_binding()
+        self.refresh_outlook_accounts()
+
+    def refresh_outlook_accounts(self) -> None:
+        if not hasattr(self, "outlook_accounts"):
+            return
+        self.outlook_accounts.clear()
+        if not self.controller.store:
+            return
+        for account in self.controller.store.list_email_accounts():
+            connector_kind = str(
+                account.get("connector_kind", EmailConnectorKind.MICROSOFT_GRAPH.value)
+            )
+            item = QTreeWidgetItem(
+                [
+                    "Yes" if account.get("active") else "",
+                    str(account.get("display_name", "")),
+                    str(account.get("username", "")),
+                    _mail_connector_label(connector_kind),
+                    (
+                        "Local read-only"
+                        if connector_kind == EmailConnectorKind.CLASSIC_OUTLOOK.value
+                        else f"{account.get('tenant_id', '')} / "
+                        + ", ".join(
+                            str(value) for value in account.get("granted_scopes", [])
+                        )
+                    ),
+                ]
+            )
+            item.setData(0, Qt.ItemDataRole.UserRole, str(account["id"]))
+            self.outlook_accounts.addTopLevelItem(item)
+
+    def activate_selected_outlook_account(self) -> None:
+        item = self.outlook_accounts.currentItem()
+        account_id = str(item.data(0, Qt.ItemDataRole.UserRole)) if item else ""
+        if not account_id:
+            QMessageBox.information(
+                self, "Select a mailbox", "Select a configured Outlook mailbox first."
+            )
+            return
+        if not self.controller.store:
+            QMessageBox.warning(self, "Workspace required", "Open a workspace first.")
+            return
+        service = EmailService(self.controller.store, GraphClient(UrllibGraphTransport()))
+        try:
+            account = service.activate_account(account_id)
+            self.controller.activity_changed.emit()
+            self.controller.mail_account_changed.emit()
+            self.status.setText(f"Active mailbox changed to {account.username}.")
+        except Exception as error:
+            QMessageBox.critical(self, "Mailbox could not be activated", str(error))
+
+    def save_outlook_binding(self) -> None:
+        client_id = self.outlook_client_id.text().strip()
+        tenant = self.outlook_tenant.text().strip() or "common"
+        try:
+            client_id = str(UUID(client_id))
+        except (ValueError, AttributeError):
+            QMessageBox.warning(
+                self,
+                "Outlook binding not saved",
+                "Enter a valid Microsoft Entra application (client) ID.",
+            )
+            return
+        reserved_tenants = {"common", "organizations", "consumers"}
+        tenant_is_safe = (
+            tenant.casefold() in reserved_tenants
+            or (
+                tenant.isascii()
+                and 1 <= len(tenant) <= 255
+                and all(character.isalnum() or character in ".-_" for character in tenant)
+            )
+        )
+        if not tenant_is_safe:
+            QMessageBox.warning(
+                self,
+                "Outlook binding not saved",
+                "Use common, organizations, consumers, a tenant GUID, or a tenant domain.",
+            )
+            return
+        self.settings.setValue("outlook/clientId", client_id)
+        self.settings.setValue("outlook/tenant", tenant.casefold())
+        self.settings.sync()
+        self.refresh_outlook_binding()
+        self.status.setText(
+            "Outlook binding saved locally. Use Mailbox → Connect another Outlook mailbox."
+        )
+
+    def clear_outlook_binding(self) -> None:
+        self.settings.remove("outlook/clientId")
+        self.settings.remove("outlook/tenant")
+        self.settings.sync()
+        self.refresh_outlook_binding()
+        self.status.setText(
+            "The in-app Outlook binding was removed. Protected sign-in tokens were not exported "
+            "or written to the workspace."
         )
 
     def save_workspace_guidance(self) -> None:
@@ -5918,7 +6347,7 @@ class _EmailConnectorWorkflow(QWidget):
         self.banner.setWordWrap(True)
         layout.addWidget(self.banner)
         controls = QHBoxLayout()
-        sign_in = QPushButton("Sign in read-only…")
+        sign_in = QPushButton("Connect another Outlook mailbox…")
         sign_in.clicked.connect(self.sign_in)
         sync = QPushButton("Refresh selected mailbox metadata")
         sync.clicked.connect(self.sync)
@@ -6034,23 +6463,114 @@ class _EmailConnectorWorkflow(QWidget):
             raise RuntimeError("Open a workspace first")
         return EmailService(self.controller.store, GraphClient(UrllibGraphTransport()))
 
+    def _device_auth(self) -> MsalDeviceAuth:
+        client_id, authority, _source = _outlook_auth_configuration()
+        if not client_id:
+            raise RuntimeError(
+                "Configure the Outlook application binding under Mail Settings before signing in."
+            )
+        return MsalDeviceAuth(client_id, authority=authority)
+
     def _interactive_token(self, scopes: tuple[str, ...]) -> tuple[MsalDeviceAuth, dict[str, Any]]:
-        auth = MsalDeviceAuth()
+        auth = self._device_auth()
         prompt = auth.begin_device_flow(scopes)
-        if prompt.verification_uri:
-            QDesktopServices.openUrl(QUrl(prompt.verification_uri))
-        QMessageBox.information(self, "Microsoft device sign-in", prompt.message)
+        application = QApplication.instance()
+        clipboard = application.clipboard() if application else None
+        previous_clipboard = clipboard.text() if clipboard else ""
+        if clipboard and prompt.user_code:
+            clipboard.setText(prompt.user_code)
+        verification_uri = (
+            getattr(prompt, "verification_uri_complete", "") or prompt.verification_uri
+        )
+        code_instruction = (
+            "Microsoft supplied a sign-in link with the code already included."
+            if getattr(prompt, "verification_uri_complete", "")
+            else "The code has been copied to the clipboard. Select OK to open Microsoft's "
+            "sign-in page, then paste this code there."
+        )
+        QMessageBox.information(
+            self,
+            "Microsoft device sign-in code",
+            "Microsoft created this one-time code for AIOrganizer:\n\n"
+            f"{prompt.user_code}\n\n"
+            f"{code_instruction} It does not come from Microsoft Authenticator.",
+        )
+        if verification_uri and not QDesktopServices.openUrl(QUrl(verification_uri)):
+            QMessageBox.warning(
+                self,
+                "Could not open Microsoft sign-in",
+                f"Open this address manually and enter {prompt.user_code}:\n\n"
+                f"{verification_uri}",
+            )
         dialog = BackgroundTaskDialog(
             "Waiting for Microsoft sign-in",
             "Complete the delegated device sign-in in your browser. AIOrganizer never receives your password.",
             lambda: auth.complete_device_flow(prompt),
             self,
+            cancel_operation=lambda: auth.cancel_device_flow(prompt),
         )
-        if dialog.run() != QDialog.DialogCode.Accepted:
-            raise RuntimeError(dialog.error_message or "Microsoft sign-in was cancelled")
+        try:
+            if dialog.run() != QDialog.DialogCode.Accepted:
+                raise RuntimeError(dialog.error_message or "Microsoft sign-in was cancelled")
+        finally:
+            if clipboard and clipboard.text() == prompt.user_code:
+                clipboard.setText(previous_clipboard)
         return auth, dict(dialog.result_value)
 
     def sign_in(self) -> None:
+        connectors = (
+            "Classic Outlook (local, read-only)",
+            "Microsoft Graph (delegated cloud access)",
+        )
+        selected, accepted = QInputDialog.getItem(
+            self, "Connect Outlook mailbox", "Connector", connectors, 0, False
+        )
+        if not accepted:
+            return
+        if selected == connectors[0]:
+            self.connect_classic_outlook()
+        else:
+            self.sign_in_graph()
+
+    def connect_classic_outlook(self) -> None:
+        try:
+            service = self._service()
+            client = ClassicOutlookClient()
+            dialog = BackgroundTaskDialog(
+                "Reading Classic Outlook profile",
+                "Discovering configured mail stores locally. No message content is read yet.",
+                client.discover_mailboxes,
+                self,
+            )
+            if dialog.run() != QDialog.DialogCode.Accepted:
+                raise RuntimeError(dialog.error_message or "Classic Outlook discovery failed")
+            accounts = service.register_classic_outlook_accounts(list(dialog.result_value or []))
+            if self.controller.store:
+                for account in accounts:
+                    self.controller.store.save_connector_source(
+                        f"classic-outlook:{account.id}",
+                        EmailConnectorKind.CLASSIC_OUTLOOK.value,
+                        account.username,
+                        {
+                            "account_id": account.id,
+                            "content_kind": "email",
+                            "access": "local_read_only",
+                        },
+                        True,
+                    )
+            self.controller.activity_changed.emit()
+            self.controller.mail_account_changed.emit()
+            self.refresh()
+            QMessageBox.information(
+                self,
+                "Classic Outlook connected",
+                f"Added or refreshed {len(accounts)} local mailbox store(s). Select one from the "
+                "Mailbox menu, then refresh its folder and bounded message metadata.",
+            )
+        except Exception as error:
+            QMessageBox.critical(self, "Classic Outlook connection failed", str(error))
+
+    def sign_in_graph(self) -> None:
         try:
             auth, result = self._interactive_token(READ_SCOPES)
             token = str(result["access_token"])
@@ -6088,7 +6608,8 @@ class _EmailConnectorWorkflow(QWidget):
                     True,
                 )
             del auth
-            self.refresh()
+            self.controller.activity_changed.emit()
+            self.controller.mail_account_changed.emit()
         except Exception as error:
             QMessageBox.critical(self, "Outlook sign-in failed", str(error))
 
@@ -6098,19 +6619,41 @@ class _EmailConnectorWorkflow(QWidget):
             account = service.active_account()
             if not account:
                 raise RuntimeError("Sign in to one mailbox first")
-            auth = MsalDeviceAuth()
-            token = auth.acquire_silent(READ_SCOPES, account.home_account_id)
-            if not token:
-                raise RuntimeError("The read token is unavailable; use Sign in read-only again")
             selected_ids = tuple(
                 str(item.data(0, Qt.ItemDataRole.UserRole))
                 for item in self.folders.selectedItems()
                 if item.data(0, Qt.ItemDataRole.UserRole)
             )
+            if account.connector_kind == EmailConnectorKind.CLASSIC_OUTLOOK.value:
+                def local_operation() -> dict[str, int | bool]:
+                    return service.sync_classic_outlook_read_only(
+                        account, ClassicOutlookClient(), selected_ids
+                    )
+
+                operation = local_operation
+                detail = (
+                    "Reading Classic Outlook locally. With no folder selected, only the Inbox is "
+                    "sampled; each refresh is bounded and secret-redacted."
+                )
+            else:
+                auth = self._device_auth()
+                token = auth.acquire_silent(READ_SCOPES, account.home_account_id)
+                if not token:
+                    raise RuntimeError(
+                        "The read token is unavailable; connect this Graph mailbox again"
+                    )
+                def graph_operation() -> dict[str, int]:
+                    return service.sync_read_only(account, token, selected_ids)
+
+                operation = graph_operation
+                detail = (
+                    "Using per-folder Graph delta cursors. Only bounded message and attachment "
+                    "metadata is read."
+                )
             dialog = BackgroundTaskDialog(
                 "Refreshing Outlook metadata",
-                "Using per-folder delta cursors. Only bounded message and attachment metadata is read.",
-                lambda: service.sync_read_only(account, token, selected_ids),
+                detail,
+                operation,
                 self,
             )
             if dialog.run() != QDialog.DialogCode.Accepted:
@@ -6260,6 +6803,14 @@ class _EmailConnectorWorkflow(QWidget):
 
     def review_permissions(self) -> None:
         try:
+            if self._active_account().connector_kind == EmailConnectorKind.CLASSIC_OUTLOOK.value:
+                QMessageBox.information(
+                    self,
+                    "Classic Outlook is read-only",
+                    "This mailbox uses local COM access and requests no Graph scopes. Applying "
+                    "folder, rule, move, or category proposals is not enabled yet.",
+                )
+                return
             review = self._service().permission_review(self._selected_proposal_ids())
             QMessageBox.information(
                 self,
@@ -6277,6 +6828,10 @@ class _EmailConnectorWorkflow(QWidget):
         try:
             service = self._service()
             account = self._active_account()
+            if account.connector_kind == EmailConnectorKind.CLASSIC_OUTLOOK.value:
+                raise PermissionError(
+                    "Classic Outlook mailboxes are read-only in this version; no COM write was attempted"
+                )
             selected = self._selected_proposal_ids()
             review = service.permission_review(selected)
             granted = set(account.granted_scopes)
@@ -6291,7 +6846,7 @@ class _EmailConnectorWorkflow(QWidget):
                 if self.controller.store:
                     self.controller.store.save_email_account(account)
             else:
-                auth = MsalDeviceAuth()
+                auth = self._device_auth()
                 required = tuple(
                     sorted(set(READ_SCOPES) | set(MAIL_WRITE_SCOPES) | set(RULE_WRITE_SCOPES))
                 )
@@ -6317,8 +6872,13 @@ class _EmailConnectorWorkflow(QWidget):
     def _active_account(self):  # type: ignore[no-untyped-def]
         account = self._service().active_account()
         if not account:
-            raise RuntimeError("No active delegated mailbox")
+            raise RuntimeError("No active mailbox")
         return account
+
+    def activate_mailbox(self, account_id: str) -> None:
+        self._service().activate_account(account_id)
+        self.controller.activity_changed.emit()
+        self.controller.mail_account_changed.emit()
 
     def _selected_proposal_ids(self) -> set[str]:
         return {
@@ -6359,19 +6919,17 @@ class _EmailConnectorWorkflow(QWidget):
             tree.clear()
         self.message_metadata.clear()
         if not self.controller.store:
-            self.banner.setText(
-                "Open a workspace to configure one active delegated Outlook account."
-            )
+            self.banner.setText("Open a workspace to configure one active Outlook mailbox.")
             return
         self._refresh_handoffs()
         service = self._service()
         account = service.active_account()
         if not account:
-            configured = bool(os.getenv("AIORGANIZER_GRAPH_CLIENT_ID"))
+            client_id, _authority, source = _outlook_auth_configuration()
             self.banner.setText(
-                "No active Outlook account. Set AIORGANIZER_GRAPH_CLIENT_ID and use read-only sign-in."
-                if configured
-                else "Set AIORGANIZER_GRAPH_CLIENT_ID in .env, restart, then use read-only sign-in."
+                f"No active Outlook account. A binding is configured from {source}; connect a mailbox."
+                if client_id
+                else "No active Outlook account. Configure Outlook under Mail Settings, then connect a mailbox."
             )
             return
         self.banner.setText(
@@ -6493,7 +7051,7 @@ class EmailPage(_EmailConnectorWorkflow):
         self.banner.setWordWrap(True)
         layout.addWidget(self.banner)
         controls = QHBoxLayout()
-        sign_in = QPushButton("Sign in read-only...")
+        sign_in = QPushButton("Connect another Outlook mailbox...")
         sign_in.clicked.connect(self.sign_in)
         sync = QPushButton("Refresh selected mailbox metadata")
         sync.clicked.connect(self.sync)
@@ -6523,6 +7081,7 @@ class EmailPage(_EmailConnectorWorkflow):
         note.setWordWrap(True)
         layout.addWidget(note)
         controller.workspace_changed.connect(self.refresh)
+        controller.mail_account_changed.connect(self.refresh)
         self.refresh()
 
     def _folder_section(self) -> tuple[QTreeWidget, MailInspector, QWidget]:
@@ -6599,14 +7158,33 @@ class EmailPage(_EmailConnectorWorkflow):
         section = QWidget()
         layout = QVBoxLayout(section)
         controls = QHBoxLayout()
+        self.focused_action_filter = QComboBox()
+        self.focused_action_filter.setAccessibleName("Focused mail action")
+        self.focused_action_filter.addItem("All focused findings", "all")
+        self.focused_action_filter.addItem("Find registrations & accounts", "registrations")
+        self.focused_action_filter.addItem("Find invoices & receipts", "invoices")
+        self.focused_action_filter.addItem("Find forgotten / urgent tasks", "tasks")
+        self.focused_action_filter.addItem("Find unsaved attachments", "attachments")
+        self.focused_action_filter.addItem("Find renewals & subscriptions", "renewals")
+        self.focused_action_filter.addItem("Find security & account changes", "security")
+        run = QPushButton("Run focused action")
+        run.clicked.connect(self.refresh)
         move = QPushButton("Propose message move...")
         move.clicked.connect(self.propose_move)
         categories = QPushButton("Propose message categories...")
         categories.clicked.connect(self.propose_categories)
+        controls.addWidget(self.focused_action_filter)
+        controls.addWidget(run)
         controls.addWidget(move)
         controls.addWidget(categories)
         controls.addStretch()
         layout.addLayout(controls)
+        self.focused_action_summary = QLabel(
+            "Focused actions search the bounded, redacted local mail cache. Results are review "
+            "candidates, not proof that an account, payment, or task was missed."
+        )
+        self.focused_action_summary.setWordWrap(True)
+        layout.addWidget(self.focused_action_summary)
         self.mail_action_guidance = GuidanceContextBar(
             "mail_action",
             self.controller.compile_prompt,
@@ -6616,7 +7194,14 @@ class EmailPage(_EmailConnectorWorkflow):
         layout.addWidget(self.mail_action_guidance)
         tree = QTreeWidget()
         tree.setHeaderLabels(
-            ["Finding", "Received", "Message / Attachment", "Confidence", "Why review"]
+            [
+                "Focused action",
+                "Received",
+                "Message / Attachment",
+                "Sender / account",
+                "Confidence",
+                "Why review",
+            ]
         )
         configure_data_tree(tree)
         install_tree_context_menu(tree, self._email_proposal_context_actions)
@@ -6630,10 +7215,29 @@ class EmailPage(_EmailConnectorWorkflow):
         tree.currentItemChanged.connect(self._preview_focused_row)
         return tree, inspector, section
 
+    def _selected_focused_kinds(self) -> set[str] | None:
+        selected = str(self.focused_action_filter.currentData() or "all")
+        if selected == "all":
+            return None
+        kinds = {
+            "registrations": {"registration_data"},
+            "invoices": {"invoice_or_receipt"},
+            "tasks": {"forgotten_task"},
+            "attachments": {"attachment_not_recorded_as_saved"},
+            "renewals": {"renewal_or_subscription"},
+            "security": {"security_or_account_change"},
+        }
+        return kinds.get(selected, set())
+
+    def _focused_finding_is_visible(self, finding: dict[str, Any]) -> bool:
+        included_kinds = self._selected_focused_kinds()
+        return included_kinds is None or str(finding.get("kind", "")) in included_kinds
+
     def set_section(self, index: int) -> None:
         if 0 <= index < self.sections.count():
             self.sections.setCurrentIndex(index)
             self.title.setText(f"Mail - {self.SECTION_LABELS[index]}")
+            self.refresh()
 
     def propose_folder_rename(self) -> None:
         try:
@@ -6943,21 +7547,34 @@ class EmailPage(_EmailConnectorWorkflow):
         for inspector in (self.folder_inspector, self.rule_inspector, self.action_inspector):
             inspector.clear()
         if not self.controller.store:
-            self.banner.setText(
-                "Open a workspace to configure one active delegated Outlook account."
+            self.banner.setText("Open a workspace to configure one active Outlook mailbox.")
+            self.focused_action_summary.setText(
+                "Open a workspace before running a focused mail action."
             )
             return
         service = self._service()
         account = service.active_account()
         if not account:
+            client_id, _authority, source = _outlook_auth_configuration()
             self.banner.setText(
-                "No active Outlook account. Configure AIORGANIZER_GRAPH_CLIENT_ID, then use "
-                "read-only sign-in."
+                f"No active mailbox. A Graph binding is configured from {source}; use "
+                "Mailbox → Connect another Outlook mailbox, or connect Classic Outlook locally."
+                if client_id
+                else "No active mailbox. Connect Classic Outlook locally, or configure Microsoft "
+                "Graph under Mail Settings."
+            )
+            self.focused_action_summary.setText(
+                "Connect an Outlook account and refresh its bounded local cache first."
             )
             return
+        connector = _mail_connector_label(account.connector_kind)
+        access = (
+            "local read-only"
+            if account.connector_kind == EmailConnectorKind.CLASSIC_OUTLOOK.value
+            else "delegated scopes: " + ", ".join(account.granted_scopes)
+        )
         self.banner.setText(
-            f"Active mailbox: {account.display_name} <{account.username}>. Delegated scopes: "
-            + ", ".join(account.granted_scopes)
+            f"Active mailbox: {account.display_name} <{account.username}> via {connector}; {access}."
         )
         folders = self.controller.store.list_mail_folders(account.id)
         folder_by_id = {str(value["id"]): value for value in folders}
@@ -7051,7 +7668,12 @@ class EmailPage(_EmailConnectorWorkflow):
                 self.rule_plan.addTopLevelItem(item)
 
         security = self.controller.store.list_account_security_evidence(account.id)
-        findings = focused_mail_findings(messages, attachments, security)
+        findings = focused_mail_findings(
+            messages,
+            attachments,
+            security,
+            included_kinds=self._selected_focused_kinds(),
+        )
         for proposal in proposals:
             kind = EmailProposalKind(proposal["kind"])
             if kind not in {EmailProposalKind.MESSAGE_MOVE, EmailProposalKind.MESSAGE_CATEGORIZE}:
@@ -7085,7 +7707,16 @@ class EmailPage(_EmailConnectorWorkflow):
                     "confidence": 1.0,
                 }
             )
-        for finding in findings:
+        visible_findings = [
+            finding for finding in findings if self._focused_finding_is_visible(finding)
+        ]
+        selected_label = self.focused_action_filter.currentText()
+        self.focused_action_summary.setText(
+            f"{selected_label}: {len(visible_findings):,} review candidate(s) from "
+            f"{len(messages):,} cached message(s). Matching is local and heuristic; account "
+            "inventory entries and saved-attachment state still require user confirmation."
+        )
+        for finding in visible_findings:
             message_id = str(finding.get("message_id", ""))
             message = message_by_id.get(message_id)
             item = QTreeWidgetItem(
@@ -7093,6 +7724,11 @@ class EmailPage(_EmailConnectorWorkflow):
                     str(finding["kind"]).replace("_", " ").title(),
                     str(finding.get("received_at", "")),
                     str(finding.get("title", "")),
+                    str(
+                        finding.get("sender")
+                        or (message or {}).get("sender_name")
+                        or (message or {}).get("sender_address", "")
+                    ),
                     f"{float(finding.get('confidence', 0)):.0%}",
                     str(finding.get("reason", "")),
                 ]
